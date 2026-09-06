@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-wasip2
+          targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - run: cargo install wasm-tools --version 1.255.0 --locked
       - run: cargo test --manifest-path route/Cargo.toml
