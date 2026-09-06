@@ -717,7 +717,14 @@ fn validate_service(value: Option<String>) -> Result<Option<String>, DispatchRes
             while value.ends_with('/') {
                 value.pop();
             }
-            if !value.starts_with("https://") || value[8..].contains('/') || value.len() > 255 {
+            let authority = value.strip_prefix("https://").unwrap_or_default();
+            if authority.is_empty()
+                || value.len() > 255
+                || !authority.bytes().any(|byte| byte.is_ascii_alphanumeric())
+                || !authority.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
+                })
+            {
                 return Err(invalid("transaction_service must be an HTTPS origin"));
             }
             Ok(value)
@@ -769,6 +776,9 @@ pub fn bind(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
 }
 
 pub fn read_binding(wallet: &str, safe_id: &str) -> DispatchResponse {
+    if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(safe_id, "safe id")) {
+        return e;
+    }
     let binding: Binding = match load(&binding_key(wallet, safe_id), "Safe binding") {
         Ok(v) => v,
         Err(e) => return e,
@@ -1188,6 +1198,10 @@ fn normalize_signature(mut value: Vec<u8>) -> Result<String, DispatchResponse> {
 }
 
 pub fn confirm(ctx: &petal::Ctx, wallet: &str, id: &str) -> DispatchResponse {
+    if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
+    {
+        return e;
+    }
     let mut state: TransactionState = match load(&tx_key(wallet, id), "Safe transaction") {
         Ok(v) => v,
         Err(e) => return e,
@@ -1463,6 +1477,10 @@ fn ordered_signatures(
 }
 
 pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
+    if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
+    {
+        return e;
+    }
     let mut request: ExecuteRequest = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return invalid(format!("invalid execution JSON: {e}")),
@@ -1565,6 +1583,10 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
 }
 
 pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
+    if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
+    {
+        return e;
+    }
     let mut state: TransactionState = match load(&tx_key(wallet, id), "Safe transaction") {
         Ok(v) => v,
         Err(e) => return e,
@@ -1609,16 +1631,20 @@ pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
 }
 
 pub fn set_service_key(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
+    if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(safe_id, "safe id")) {
+        return e;
+    }
     if body.is_empty() || body.len() > 8192 {
         return invalid("service key must contain 1 to 8192 bytes");
     }
-    if body
-        .iter()
-        .any(|b| b.is_ascii_control() && !matches!(*b, b'\n' | b'\r' | b'\t'))
-    {
-        return invalid("service key contains control bytes");
+    let key = match std::str::from_utf8(body) {
+        Ok(value) => value.trim(),
+        Err(_) => return invalid("service key must be UTF-8"),
+    };
+    if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return invalid("service key must contain only visible ASCII without spaces");
     }
-    match petal::sdk::store_put(&api_key_key(wallet, safe_id), body, true) {
+    match petal::sdk::store_put(&api_key_key(wallet, safe_id), key.as_bytes(), true) {
         Ok(()) => DispatchResponse::Write,
         Err(e) => sdk_error(e),
     }
@@ -1699,6 +1725,18 @@ mod tests {
             preimage,
             signing_preimage("1", "0x1000000000000000000000000000000000000000", &changed).unwrap()
         );
+        assert_eq!(
+            validate_service(Some("https://safe.example/".into())).unwrap(),
+            Some("https://safe.example".into())
+        );
+        for invalid in [
+            "http://safe.example",
+            "https://user@safe.example",
+            "https://safe.example/api",
+            "https://safe.example?token=value",
+        ] {
+            assert!(validate_service(Some(invalid.into())).is_err());
+        }
     }
 
     #[test]
