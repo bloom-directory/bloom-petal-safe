@@ -807,6 +807,20 @@ fn configuration(
     )
 }
 
+fn transaction_context_matches(
+    binding: &Binding,
+    state: &TransactionState,
+    current: &SafeSnapshot,
+) -> bool {
+    state.wallet == binding.wallet
+        && state.snapshot.safe_address == binding.safe.safe_address
+        && state.snapshot.safe_address == current.safe_address
+        && state.snapshot.chain_id == binding.safe.chain_id
+        && state.snapshot.chain_id == current.chain_id
+        && configuration(&state.snapshot) == configuration(&binding.safe)
+        && configuration(&state.snapshot) == configuration(current)
+}
+
 fn encode_batch(calls: &[Call], safe: &str) -> Result<Vec<u8>, DispatchResponse> {
     if calls.is_empty() || calls.len() > 32 {
         return Err(invalid("batch must contain 1 to 32 calls"));
@@ -847,9 +861,11 @@ fn code_hash(chain: &str, library: Library) -> Result<String, DispatchResponse> 
 fn build_tx(
     binding: &Binding,
     request: &TransactionRequest,
-) -> Result<(SafeTx, Option<String>), DispatchResponse> {
+) -> Result<(SafeTx, Option<String>, SafeSnapshot), DispatchResponse> {
     let current = inspect(&binding.chain, &binding.safe.safe_address)?;
-    if configuration(&binding.safe) != configuration(&current) {
+    if binding.safe.chain_id != current.chain_id
+        || configuration(&binding.safe) != configuration(&current)
+    {
         return Err(denied(
             "Safe configuration changed; bind it again before drafting",
         ));
@@ -1020,9 +1036,9 @@ fn build_tx(
         gas_price: "0".into(),
         gas_token: ZERO.into(),
         refund_receiver: ZERO.into(),
-        nonce: current.nonce,
+        nonce: current.nonce.clone(),
     };
-    Ok((tx, library_hash))
+    Ok((tx, library_hash, current))
 }
 
 fn word_address(address: Address) -> [u8; 32] {
@@ -1083,7 +1099,7 @@ pub fn create_transaction(wallet: &str, safe_id: &str, id: &str, body: &[u8]) ->
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (safe_tx, library_code_hash) = match build_tx(&binding, &request) {
+    let (safe_tx, library_code_hash, snapshot) = match build_tx(&binding, &request) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1098,7 +1114,7 @@ pub fn create_transaction(wallet: &str, safe_id: &str, id: &str, body: &[u8]) ->
         safe_id: safe_id.into(),
         id: id.into(),
         request,
-        snapshot: binding.safe.clone(),
+        snapshot,
         safe_tx,
         safe_tx_hash: format!("{:#x}", keccak256(preimage)),
         phase: "draft".into(),
@@ -1214,7 +1230,7 @@ pub fn confirm(ctx: &petal::Ctx, wallet: &str, id: &str) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if configuration(&binding.safe) != configuration(&current)
+    if !transaction_context_matches(&binding, &state, &current)
         || current.nonce != state.safe_tx.nonce
     {
         return denied("Safe configuration or nonce changed; create a new transaction");
@@ -1289,6 +1305,9 @@ pub fn confirm(ctx: &petal::Ctx, wallet: &str, id: &str) -> DispatchResponse {
             };
             state.approval_action_id = None;
             state.phase = "signed".into();
+            if let Err(e) = save(&tx_key(wallet, id), &state) {
+                return e;
+            }
             if binding.transaction_service.is_some() {
                 match publish(&binding, &state) {
                     Ok(status) => {
@@ -1500,10 +1519,21 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if configuration(&binding.safe) != configuration(&current)
+    if !transaction_context_matches(&binding, &state, &current)
         || current.nonce != state.safe_tx.nonce
     {
         return denied("Safe configuration or nonce changed before execution");
+    }
+    let preimage = match signing_preimage(
+        &binding.safe.chain_id,
+        &binding.safe.safe_address,
+        &state.safe_tx,
+    ) {
+        Ok(value) => value,
+        Err(e) => return e,
+    };
+    if format!("{:#x}", keccak256(preimage)) != state.safe_tx_hash {
+        return backend("stored Safe transaction hash is inconsistent");
     }
     if binding.transaction_service.is_some() {
         let path = format!("/api/v1/multisig-transactions/{}/", state.safe_tx_hash);
@@ -1912,6 +1942,18 @@ mod tests {
             executor_wallet: None,
             library_code_hash: None,
         };
+        assert!(transaction_context_matches(
+            &binding,
+            &state,
+            &state.snapshot
+        ));
+        let mut rebound = binding.clone();
+        rebound.safe.safe_address = "0x2000000000000000000000000000000000000000".into();
+        assert!(!transaction_context_matches(
+            &rebound,
+            &state,
+            &state.snapshot
+        ));
         let ordered = ordered_signatures(&binding, &state, &[second.into()]).unwrap();
         assert_eq!(ordered.len(), 130);
         assert_eq!(&ordered[..65], &hex_bytes(second, "signature").unwrap());
