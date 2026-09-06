@@ -29,7 +29,6 @@ sol! {
     function getOwners() external view returns (address[]);
     function getThreshold() external view returns (uint256);
     function nonce() external view returns (uint256);
-    function getGuard() external view returns (address);
     function getModulesPaginated(address start, uint256 pageSize) external view returns (address[] array, address next);
     function getStorageAt(uint256 offset, uint256 length) external view returns (bytes);
     function multiSend(bytes transactions);
@@ -608,13 +607,16 @@ fn call(chain: &str, to: &str, data: Vec<u8>) -> Result<Vec<u8>, DispatchRespons
     )
 }
 
+/// `Safe.getStorageAt(offset, length)` measures `length` in 32-byte words, not
+/// bytes, and allocates `length * 32` bytes of return data. One word is one
+/// storage slot.
 fn storage_word(chain: &str, safe: &str, slot: U256) -> Result<Vec<u8>, DispatchResponse> {
     let result = call(
         chain,
         safe,
         getStorageAtCall {
             offset: slot,
-            length: U256::from(32),
+            length: U256::from(1),
         }
         .abi_encode(),
     )?;
@@ -623,8 +625,30 @@ fn storage_word(chain: &str, safe: &str, slot: U256) -> Result<Vec<u8>, Dispatch
         .to_vec())
 }
 
+fn storage_address(
+    chain: &str,
+    safe: &str,
+    slot: U256,
+    label: &str,
+) -> Result<Address, DispatchResponse> {
+    let word = storage_word(chain, safe, slot)?;
+    if word.len() != 32 {
+        return Err(backend(format!(
+            "Safe {label} storage word has wrong length"
+        )));
+    }
+    Ok(Address::from_slice(&word[12..]))
+}
+
+/// Safe stores the guard and fallback handler at the unmodified
+/// `keccak256` of their namespace strings. This is not the ERC-1967
+/// `keccak256(...) - 1` convention.
+fn guard_slot() -> U256 {
+    U256::from_be_bytes(keccak256("guard_manager.guard.address").0)
+}
+
 fn fallback_slot() -> U256 {
-    U256::from_be_bytes(keccak256("fallback_manager.handler.address").0).wrapping_sub(U256::from(1))
+    U256::from_be_bytes(keccak256("fallback_manager.handler.address").0)
 }
 
 fn inspect(chain: &str, safe: &str) -> Result<SafeSnapshot, DispatchResponse> {
@@ -632,6 +656,14 @@ fn inspect(chain: &str, safe: &str) -> Result<SafeSnapshot, DispatchResponse> {
     let code = rpc_hex(chain, "eth_getCode", json!([safe, "latest"]))?;
     if code.is_empty() {
         return Err(invalid("Safe address has no code"));
+    }
+    // An EIP-7702 delegated EOA carries `0xef0100 || implementation`. Its key
+    // holder can re-delegate at any time, so the recorded snapshot cannot bind
+    // the account's behaviour the way a Safe proxy does.
+    if code.starts_with(&[0xef, 0x01]) {
+        return Err(denied(
+            "EIP-7702 delegated accounts are not supported as Safes",
+        ));
     }
     let chain_id_value = chain_result(chain, "eth_chainId", json!([]))?;
     let chain_hex = chain_id_value
@@ -666,9 +698,9 @@ fn inspect(chain: &str, safe: &str) -> Result<SafeSnapshot, DispatchResponse> {
     let nonce_result = call(chain, &safe, nonceCall {}.abi_encode())?;
     let nonce = nonceCall::abi_decode_returns(&nonce_result)
         .map_err(|e| backend(format!("decode nonce: {e}")))?;
-    let guard_result = call(chain, &safe, getGuardCall {}.abi_encode())?;
-    let guard = getGuardCall::abi_decode_returns(&guard_result)
-        .map_err(|e| backend(format!("decode guard: {e}")))?;
+    // `getGuard()` is `internal` on Safe 1.3.0/1.4.1 and has no selector on
+    // the deployed contract; the guard is only reachable through storage.
+    let guard = storage_address(chain, &safe, guard_slot(), "guard")?;
     let modules_result = call(
         chain,
         &safe,
@@ -688,11 +720,7 @@ fn inspect(chain: &str, safe: &str) -> Result<SafeSnapshot, DispatchResponse> {
         .into_iter()
         .map(|a| format!("{a:#x}"))
         .collect();
-    let singleton_word = storage_word(chain, &safe, U256::ZERO)?;
-    if singleton_word.len() != 32 {
-        return Err(backend("Safe singleton storage word has wrong length"));
-    }
-    let singleton = Address::from_slice(&singleton_word[12..]);
+    let singleton = storage_address(chain, &safe, U256::ZERO, "singleton")?;
     let singleton_address = format!("{singleton:#x}");
     let singleton_code = rpc_hex(chain, "eth_getCode", json!([singleton_address, "latest"]))?;
     let singleton_code_hash = format!("{:#x}", keccak256(singleton_code));
@@ -701,11 +729,7 @@ fn inspect(chain: &str, safe: &str) -> Result<SafeSnapshot, DispatchResponse> {
             "Safe singleton address or runtime code is not a supported official deployment",
         ));
     }
-    let fallback_word = storage_word(chain, &safe, fallback_slot())?;
-    if fallback_word.len() != 32 {
-        return Err(backend("Safe fallback storage word has wrong length"));
-    }
-    let fallback_handler = Address::from_slice(&fallback_word[12..]);
+    let fallback_handler = storage_address(chain, &safe, fallback_slot(), "fallback handler")?;
     Ok(SafeSnapshot {
         chain_id: chain_id.to_string(),
         safe_address: safe,
@@ -1209,11 +1233,27 @@ fn claim(ctx: &petal::Ctx, preimage: &[u8], hash: B256) -> Result<Vec<u8>, Dispa
     })).map_err(|e| backend(e.to_string()))
 }
 
+/// `checkNSignatures` recovers `v > 30` signatures against the `eth_sign`
+/// prefixed digest with `v - 4`, so a Safe UI co-signer using `eth_sign`
+/// produces a signature that only verifies against this preimage.
+fn eth_sign_digest(hash: B256) -> B256 {
+    let mut prefixed = Vec::with_capacity(28 + 32);
+    prefixed.extend_from_slice(b"\x19Ethereum Signed Message:\n32");
+    prefixed.extend_from_slice(hash.as_slice());
+    keccak256(prefixed)
+}
+
 fn signature_address(value: &[u8], hash: B256) -> Result<Address, DispatchResponse> {
     if value.len() != 65 {
         return Err(invalid("Safe owner signature must be 65 bytes"));
     }
     let mut normalized = value.to_vec();
+    let digest = if normalized[64] > 30 {
+        normalized[64] -= 4;
+        eth_sign_digest(hash)
+    } else {
+        hash
+    };
     if normalized[64] >= 27 {
         normalized[64] -= 27;
     }
@@ -1222,7 +1262,7 @@ fn signature_address(value: &[u8], hash: B256) -> Result<Address, DispatchRespon
     }
     Signature::from_raw(&normalized)
         .map_err(|e| invalid(format!("invalid owner signature: {e}")))?
-        .recover_address_from_prehash(&hash)
+        .recover_address_from_prehash(&digest)
         .map_err(|e| invalid(format!("cannot recover owner signature: {e}")))
 }
 
@@ -1491,21 +1531,39 @@ fn ordered_signatures(
         .map(|v| address(v, "owner"))
         .collect::<Result<BTreeSet<_>, _>>()?;
     let mut signatures = BTreeMap::new();
-    for value in state.owner_signature.iter().chain(additional) {
+    let mut record = |owner: Address, mut bytes: Vec<u8>| {
+        if bytes[64] < 27 {
+            bytes[64] += 27;
+        }
+        signatures.entry(owner).or_insert(bytes);
+    };
+    // Bloom's own signature is authoritative and must be well formed.
+    if let Some(value) = state.owner_signature.as_ref() {
         let bytes = parse_signature(value)?;
         let owner = signature_address(&bytes, hash)?;
         if !owners.contains(&owner) {
             return Err(denied("signature does not belong to a current Safe owner"));
         }
-        let mut safe_bytes = bytes;
-        if safe_bytes[64] < 27 {
-            safe_bytes[64] += 27;
+        record(owner, bytes);
+    }
+    // Transaction Service confirmations are third-party data and include
+    // signature types this Petal cannot order or re-encode: contract
+    // signatures (v=0) carry a dynamic tail whose offsets would have to be
+    // rewritten on sort, and approved-hash entries (v=1) are not recoverable.
+    // Skipping what we cannot use keeps a Safe with such a co-signer
+    // executable whenever the remaining signatures still meet the threshold,
+    // instead of failing the whole batch.
+    for value in additional {
+        let Ok(bytes) = parse_signature(value) else {
+            continue;
+        };
+        let Ok(owner) = signature_address(&bytes, hash) else {
+            continue;
+        };
+        if !owners.contains(&owner) {
+            continue;
         }
-        if let Some(existing) = signatures.insert(owner, safe_bytes.clone())
-            && existing != safe_bytes
-        {
-            return Err(invalid("conflicting signatures for one Safe owner"));
-        }
+        record(owner, bytes);
     }
     let threshold: usize = binding
         .safe
@@ -1991,11 +2049,28 @@ mod tests {
         assert_eq!(&ordered[..65], &hex_bytes(second, "signature").unwrap());
         assert!(ordered_signatures(&binding, &state, &[first.into()]).is_err());
 
+        // The same owner confirming through `eth_sign` also satisfies the
+        // threshold, and its v = 31 is forwarded intact so the Safe recovers
+        // it against the prefixed digest.
+        let ordered = ordered_signatures(&binding, &state, &[ETH_SIGN_SECOND.into()]).unwrap();
+        assert_eq!(ordered.len(), 130);
+        assert_eq!(ordered[64], 31);
+
+        // Confirmations the Petal cannot order or re-encode are skipped rather
+        // than failing the batch: a stale confirmation from a removed owner
+        // still leaves the remaining signatures valid.
         let mut one_owner = binding.clone();
         one_owner.safe.owners.truncate(1);
         one_owner.safe.threshold = "1".into();
-        assert!(ordered_signatures(&one_owner, &state, &[second.into()]).is_err());
+        let ordered = ordered_signatures(&one_owner, &state, &[second.into()]).unwrap();
+        assert_eq!(ordered.len(), 65);
 
+        // Bloom's own signature is still held strictly.
+        let mut foreign = one_owner.clone();
+        foreign.safe.owners = vec![binding.safe.owners[1].clone()];
+        assert!(ordered_signatures(&foreign, &state, &[]).is_err());
+
+        // Skipped confirmations cannot make up a missing threshold.
         let mut malformed = hex_bytes(second, "signature").unwrap();
         malformed[64] = 29;
         assert!(
@@ -2003,5 +2078,46 @@ mod tests {
                 .is_err()
         );
         assert!(ordered_signatures(&binding, &state, &[format!("{second}00")]).is_err());
+    }
+
+    /// Owner 0x7099… signing the Safe transaction hash with `eth_sign`; Safe
+    /// encodes that recovery id as 27 + 4.
+    const ETH_SIGN_SECOND: &str = "0x2e6dca42b83713f6a5fb58df54ceba0c3f2edfeeaa1baef22047fa1002e43ffe4d29eb403cb50415b87c04dcd5d38a0841ec5d8831aaa254a5b9f98ac40e64b91f";
+
+    #[test]
+    fn eth_sign_confirmations_recover_against_the_prefixed_digest() {
+        let hash = B256::from_slice(
+            &hex_bytes(
+                "0xa6119a03d6d492a10575b05da6c5eb47b9aae120c346935ef329c9a9a559a509",
+                "hash",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            format!("{:#x}", eth_sign_digest(hash)),
+            "0x2b43ff160652daadcf59ef3eae61ee073cf001c6d6859cca220940245362b1f9"
+        );
+        let recovered =
+            signature_address(&hex_bytes(ETH_SIGN_SECOND, "signature").unwrap(), hash).unwrap();
+        assert_eq!(
+            format!("{recovered:#x}"),
+            "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+        );
+    }
+
+    #[test]
+    fn safe_config_slots_match_the_deployed_contract_constants() {
+        // GuardManager.GUARD_STORAGE_SLOT and
+        // FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT on Safe 1.3.0/1.4.1
+        // are the unmodified keccak256 of their namespace strings; neither
+        // uses the ERC-1967 `keccak256(...) - 1` convention.
+        assert_eq!(
+            format!("{:#066x}", guard_slot()),
+            "0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8"
+        );
+        assert_eq!(
+            format!("{:#066x}", fallback_slot()),
+            "0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5"
+        );
     }
 }

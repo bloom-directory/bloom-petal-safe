@@ -89,7 +89,7 @@ The encoded `execTransaction` is staged in Bloom's native EVM outbox and require
 
 ## Development
 
-Run the Rust and component checks with `cargo test --manifest-path route/Cargo.toml`, `cargo clippy --manifest-path route/Cargo.toml --all-targets -- -D warnings`, and `scripts/build.sh`. The Anvil proof uses the official Safe 1.4.1 runtime and exercises every supported transaction family:
+Run the Rust and component checks with `cargo test --manifest-path route/Cargo.toml`, `cargo clippy --manifest-path route/Cargo.toml --all-targets -- -D warnings`, and `scripts/build.sh`. The Anvil proof installs the official Safe 1.4.1 runtime and executes every supported transaction family against it, checking the Safe transaction encoding on-chain. It drives the Safe contracts directly rather than the compiled route, and installs only 1.4.1, so the 1.3.0 and 1.5.0 pinned deployments are not covered by it:
 
 ```sh
 npm ci
