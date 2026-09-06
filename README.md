@@ -7,7 +7,7 @@ The Petal supports Safe 1.3.0, 1.4.1, and 1.5.0, native transfers, arbitrary cal
 ## Install and policy
 
 ```sh
-bloom petals install github:bloom-directory/bloom-petal-safe
+bloom petals install https://github.com/bloom-directory/bloom-petal-safe
 bloom petals ls
 ```
 
