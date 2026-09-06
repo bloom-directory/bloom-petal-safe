@@ -5,6 +5,7 @@ use std::{
     str::FromStr,
 };
 
+use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{Address, B256, Signature, U256, keccak256};
 use alloy_sol_types::{SolCall, sol};
 use petal::{
@@ -106,9 +107,29 @@ pub struct BuilderTransaction {
     #[serde(default)]
     pub data: Option<String>,
     #[serde(default)]
-    pub contract_method: Option<Value>,
+    pub contract_method: Option<BuilderMethod>,
     #[serde(default)]
-    pub contract_inputs_values: Option<Value>,
+    pub contract_inputs_values: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderMethod {
+    pub inputs: Vec<BuilderInput>,
+    pub name: String,
+    pub payable: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BuilderInput {
+    #[serde(default)]
+    pub internal_type: Option<String>,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub sol_type: String,
+    #[serde(default)]
+    pub components: Vec<BuilderInput>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -370,6 +391,157 @@ fn hex_bytes(value: &str, field: &str) -> Result<Vec<u8>, DispatchResponse> {
         return Err(invalid(format!("{field} is too large")));
     }
     Ok(bytes)
+}
+
+fn builder_type(input: &BuilderInput) -> Result<DynSolType, DispatchResponse> {
+    let canonical = if let Some(suffix) = input.sol_type.strip_prefix("tuple") {
+        let components = input
+            .components
+            .iter()
+            .map(builder_type)
+            .collect::<Result<Vec<_>, _>>()?;
+        format!(
+            "({}){suffix}",
+            components
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    } else {
+        if !input.components.is_empty() {
+            return Err(invalid(
+                "Transaction Builder components are allowed only for tuple inputs",
+            ));
+        }
+        input.sol_type.clone()
+    };
+    DynSolType::parse(&canonical).map_err(|e| {
+        invalid(format!(
+            "invalid Transaction Builder ABI type {canonical}: {e}"
+        ))
+    })
+}
+
+fn json_coercion(value: &Value, ty: &DynSolType) -> Option<String> {
+    match ty {
+        DynSolType::Tuple(types) => {
+            let values = value.as_array()?;
+            if values.len() != types.len() {
+                return None;
+            }
+            Some(format!(
+                "({})",
+                values
+                    .iter()
+                    .zip(types)
+                    .map(|(value, ty)| json_coercion(value, ty))
+                    .collect::<Option<Vec<_>>>()?
+                    .join(",")
+            ))
+        }
+        DynSolType::Array(ty) | DynSolType::FixedArray(ty, _) => Some(format!(
+            "[{}]",
+            value
+                .as_array()?
+                .iter()
+                .map(|value| json_coercion(value, ty))
+                .collect::<Option<Vec<_>>>()?
+                .join(",")
+        )),
+        DynSolType::Bool => match value {
+            Value::Bool(value) => Some(value.to_string()),
+            Value::Number(value) if value.as_u64() == Some(0) => Some("false".into()),
+            Value::Number(value) if value.as_u64() == Some(1) => Some("true".into()),
+            Value::String(value) if value.eq_ignore_ascii_case("true") || value == "1" => {
+                Some("true".into())
+            }
+            Value::String(value) if value.eq_ignore_ascii_case("false") || value == "0" => {
+                Some("false".into())
+            }
+            _ => None,
+        },
+        DynSolType::String => value
+            .as_str()
+            .filter(|value| !value.contains('"') && !value.contains('\\'))
+            .map(|value| format!("\"{value}\"")),
+        _ => match value {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        },
+    }
+}
+
+fn coerce_builder_value(ty: &DynSolType, raw: &str) -> Result<DynSolValue, String> {
+    match ty.coerce_str(raw) {
+        Ok(value) => Ok(value),
+        Err(original) => {
+            let value: Value = serde_json::from_str(raw).map_err(|_| original.to_string())?;
+            let normalized = json_coercion(&value, ty).ok_or_else(|| original.to_string())?;
+            ty.coerce_str(&normalized)
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn encode_builder_method(
+    method: &BuilderMethod,
+    fields: Option<&BTreeMap<String, String>>,
+) -> Result<Vec<u8>, DispatchResponse> {
+    if method.inputs.len() > 64 {
+        return Err(invalid("Transaction Builder method has too many inputs"));
+    }
+    if method.name.is_empty()
+        || matches!(method.name.as_str(), "receive" | "fallback")
+        || !method
+            .name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(invalid("Transaction Builder method name is invalid"));
+    }
+    let empty = BTreeMap::new();
+    let fields = fields.unwrap_or(&empty);
+    let mut used = BTreeSet::new();
+    let mut types = Vec::with_capacity(method.inputs.len());
+    let mut values = Vec::with_capacity(method.inputs.len());
+    for (index, input) in method.inputs.iter().enumerate() {
+        let key = if input.name.is_empty() {
+            index.to_string()
+        } else {
+            input.name.clone()
+        };
+        let raw = fields
+            .get(&key)
+            .ok_or_else(|| invalid(format!("Transaction Builder input {key} is missing")))?;
+        let ty = builder_type(input)?;
+        let value = coerce_builder_value(&ty, raw).map_err(|e| {
+            invalid(format!(
+                "Transaction Builder input {key} does not match {ty}: {e}"
+            ))
+        })?;
+        used.insert(key);
+        types.push(ty);
+        values.push(value);
+    }
+    if fields.keys().any(|key| !used.contains(key)) {
+        return Err(invalid(
+            "Transaction Builder contains an input value not declared by contractMethod",
+        ));
+    }
+    let signature = format!(
+        "{}({})",
+        method.name,
+        types
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut data = keccak256(signature).as_slice()[..4].to_vec();
+    data.extend_from_slice(&DynSolValue::Tuple(values).abi_encode_params());
+    Ok(data)
 }
 
 fn wallet_address(wallet: &str) -> Result<String, DispatchResponse> {
@@ -738,12 +910,24 @@ fn build_tx(
                     let data = match (&transaction.data, &transaction.contract_method) {
                         (Some(data), _) => data.clone(),
                         (None, None) => empty_hex(),
-                        (None, Some(_)) => {
-                            return Err(invalid(
-                                "Transaction Builder entries with contractMethod must include encoded data",
-                            ));
-                        }
+                        (None, Some(method)) => format!(
+                            "0x{}",
+                            hex::encode(encode_builder_method(
+                                method,
+                                transaction.contract_inputs_values.as_ref()
+                            )?)
+                        ),
                     };
+                    if transaction
+                        .contract_method
+                        .as_ref()
+                        .is_some_and(|method| !method.payable)
+                        && uint(&transaction.value, "transaction.value")? != U256::ZERO
+                    {
+                        return Err(invalid(
+                            "Transaction Builder sends value to a nonpayable method",
+                        ));
+                    }
                     Ok(Call {
                         to: transaction.to.clone(),
                         value: transaction.value.clone(),
@@ -1582,6 +1766,63 @@ mod tests {
             request,
             TransactionRequest::TransactionBuilder { .. }
         ));
+    }
+
+    #[test]
+    fn encodes_transaction_builder_methods_and_tuple_arrays() {
+        let boolean = BuilderMethod {
+            inputs: vec![BuilderInput {
+                internal_type: Some("bool".into()),
+                name: "newValue".into(),
+                sol_type: "bool".into(),
+                components: vec![],
+            }],
+            name: "testBooleanValue".into(),
+            payable: false,
+        };
+        let fields = BTreeMap::from([("newValue".into(), "true".into())]);
+        assert_eq!(
+            format!(
+                "0x{}",
+                hex::encode(encode_builder_method(&boolean, Some(&fields)).unwrap())
+            ),
+            "0x6b8515ae0000000000000000000000000000000000000000000000000000000000000001"
+        );
+
+        let tuple_array = BuilderMethod {
+            inputs: vec![BuilderInput {
+                internal_type: Some("tuple[]".into()),
+                name: "items".into(),
+                sol_type: "tuple[]".into(),
+                components: vec![
+                    BuilderInput {
+                        internal_type: Some("address".into()),
+                        name: "account".into(),
+                        sol_type: "address".into(),
+                        components: vec![],
+                    },
+                    BuilderInput {
+                        internal_type: Some("uint256".into()),
+                        name: "amount".into(),
+                        sol_type: "uint256".into(),
+                        components: vec![],
+                    },
+                ],
+            }],
+            name: "foo".into(),
+            payable: false,
+        };
+        let fields = BTreeMap::from([(
+            "items".into(),
+            r#"[["0x4000000000000000000000000000000000000000","7"]]"#.into(),
+        )]);
+        assert_eq!(
+            format!(
+                "0x{}",
+                hex::encode(encode_builder_method(&tuple_array, Some(&fields)).unwrap())
+            ),
+            "0xe487d1950000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000100000000000000000000000040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007"
+        );
     }
 
     #[test]

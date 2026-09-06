@@ -3,6 +3,22 @@
 version = 4
 
 [[package]]
+name = "alloy-dyn-abi"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a04eb4abc2b5074a18e687ee63918f407cc7990083cba9b999445f839796060"
+dependencies = [
+ "alloy-json-abi",
+ "alloy-primitives",
+ "alloy-sol-type-parser",
+ "alloy-sol-types",
+ "itoa",
+ "serde",
+ "serde_json",
+ "winnow",
+]
+
+[[package]]
 name = "alloy-json-abi"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1803,6 +1819,7 @@ checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
 name = "safe-route"
 version = "0.1.0"
 dependencies = [
+ "alloy-dyn-abi",
  "alloy-primitives",
  "alloy-sol-types",
  "bloom-petal-sdk",

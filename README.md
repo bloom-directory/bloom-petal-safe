@@ -44,13 +44,13 @@ Write `{"safe_id":"treasury","transaction":...}` to `petals/safe/transactions/<w
 {"kind":"call","to":"0x...","value":"0","data":"0x..."}
 {"kind":"erc20_transfer","token":"0x...","to":"0x...","amount":"1000000"}
 {"kind":"batch","calls":[{"to":"0x...","value":"0","data":"0x..."}]}
-{"kind":"transaction_builder","builder":{"version":"1.0","chainId":"1","createdAt":0,"meta":{"createdFromSafeAddress":"0x..."},"transactions":[{"to":"0x...","value":"0","data":"0x...","contractMethod":null,"contractInputsValues":null}]}}
+{"kind":"transaction_builder","builder":{"version":"1.0","chainId":"1","createdAt":0,"meta":{"createdFromSafeAddress":"0x..."},"transactions":[{"to":"0x...","value":"0","data":null,"contractMethod":{"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"transfer","payable":false},"contractInputsValues":{"to":"0x...","amount":"1000000"}}]}}
 {"kind":"create","value":"0","initcode":"0x..."}
 {"kind":"create2","value":"0","initcode":"0x...","salt":"0x<32 bytes>"}
 {"kind":"rejection"}
 ```
 
-Batches and multi-transaction Builder files use only the pinned canonical `MultiSendCallOnly`. Builder entries containing a decoded `contractMethod` must also contain their encoded `data`; Bloom never guesses calldata from descriptive fields. Deployments use only the pinned canonical `CreateCall`. The Petal reads and hashes the runtime code before drafting. Arbitrary delegatecalls and Safe self-calls are rejected. Refund fields are fixed to zero.
+Batches and multi-transaction Builder files use only the pinned canonical `MultiSendCallOnly`. Builder entries may contain raw `data` or a standard `contractMethod` plus `contractInputsValues`; Bloom ABI-encodes scalar, array, and tuple inputs and rejects missing, extra, or invalid values. Deployments use only the pinned canonical `CreateCall`. The Petal reads and hashes the runtime code before drafting. Arbitrary delegatecalls and Safe self-calls are rejected. Refund fields are fixed to zero.
 
 ## Confirm and propose
 
