@@ -248,38 +248,48 @@ struct Library {
     code_hash: &'static str,
 }
 
-fn libraries(version: &str) -> Option<(Library, Library)> {
+const MULTISEND_130: &[Library] = &[
+    Library {
+        address: "0x40a2accbd92bca938b02010e17a5b8929b49130d",
+        code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
+    },
+    Library {
+        address: "0xa1dabef33b3b82c7814b6d82a79e50f4ac44102b",
+        code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
+    },
+];
+const CREATE_130: &[Library] = &[
+    Library {
+        address: "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4",
+        code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
+    },
+    Library {
+        address: "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d",
+        code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
+    },
+];
+const MULTISEND_141: &[Library] = &[Library {
+    address: "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
+    code_hash: "0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939",
+}];
+const CREATE_141: &[Library] = &[Library {
+    address: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
+    code_hash: "0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889",
+}];
+const MULTISEND_150: &[Library] = &[Library {
+    address: "0xa83c336b20401af773b6219ba5027174338d1836",
+    code_hash: "0xcdbdcec38d2f1c7d961b0029ff8416b7e86e9974d6f0e9c9580c7d17fcfb6663",
+}];
+const CREATE_150: &[Library] = &[Library {
+    address: "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4",
+    code_hash: "0x6b7d8d29bdf7004c4617d95041923774f3f7e74b056bff55c1861c9ec92ce54f",
+}];
+
+fn libraries(version: &str) -> Option<(&'static [Library], &'static [Library])> {
     match version {
-        "1.3.0" => Some((
-            Library {
-                address: "0x40a2accbd92bca938b02010e17a5b8929b49130d",
-                code_hash: "0xa9865ac2d9c7a1591619b188c4d88167b50df6cc0c5327fcbd1c8c75f7c066ad",
-            },
-            Library {
-                address: "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4",
-                code_hash: "0x8155d988823a4f6f1bcbc76a64af8e510c4ce68819290d43cf24956bd24dee82",
-            },
-        )),
-        "1.4.1" => Some((
-            Library {
-                address: "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
-                code_hash: "0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939",
-            },
-            Library {
-                address: "0x9b35af71d77eaf8d7e40252370304687390a1a52",
-                code_hash: "0x2b3060c55fcb8275653e99ad511a71f67ba76934ed66a7d74d6e68b52afff889",
-            },
-        )),
-        "1.5.0" => Some((
-            Library {
-                address: "0xa83c336b20401af773b6219ba5027174338d1836",
-                code_hash: "0xcdbdcec38d2f1c7d961b0029ff8416b7e86e9974d6f0e9c9580c7d17fcfb6663",
-            },
-            Library {
-                address: "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4",
-                code_hash: "0x6b7d8d29bdf7004c4617d95041923774f3f7e74b056bff55c1861c9ec92ce54f",
-            },
-        )),
+        "1.3.0" => Some((MULTISEND_130, CREATE_130)),
+        "1.4.1" => Some((MULTISEND_141, CREATE_141)),
+        "1.5.0" => Some((MULTISEND_150, CREATE_150)),
         _ => None,
     }
 }
@@ -846,16 +856,20 @@ fn encode_batch(calls: &[Call], safe: &str) -> Result<Vec<u8>, DispatchResponse>
     .abi_encode())
 }
 
-fn code_hash(chain: &str, library: Library) -> Result<String, DispatchResponse> {
-    let code = rpc_hex(chain, "eth_getCode", json!([library.address, "latest"]))?;
-    let observed = format!("{:#x}", keccak256(code));
-    if !observed.eq_ignore_ascii_case(library.code_hash) {
-        return Err(denied(format!(
-            "canonical Safe library {} has unexpected runtime code",
-            library.address
-        )));
+fn verified_library(
+    chain: &str,
+    candidates: &'static [Library],
+) -> Result<(Library, String), DispatchResponse> {
+    for library in candidates {
+        let code = rpc_hex(chain, "eth_getCode", json!([library.address, "latest"]))?;
+        let observed = format!("{:#x}", keccak256(code));
+        if observed.eq_ignore_ascii_case(library.code_hash) {
+            return Ok((*library, observed));
+        }
     }
-    Ok(observed)
+    Err(denied(
+        "no supported canonical Safe library deployment has the expected runtime code",
+    ))
 }
 
 fn build_tx(
@@ -905,13 +919,16 @@ fn build_tx(
             (token, U256::ZERO, data, 0, None)
         }
         TransactionRequest::Batch { calls } => {
-            let library = libraries(&binding.safe.safe_version).unwrap().0;
+            let (library, library_hash) = verified_library(
+                &binding.chain,
+                libraries(&binding.safe.safe_version).unwrap().0,
+            )?;
             (
                 address(library.address, "MultiSendCallOnly")?,
                 U256::ZERO,
                 encode_batch(calls, &binding.safe.safe_address)?,
                 1,
-                Some(code_hash(&binding.chain, library)?),
+                Some(library_hash),
             )
         }
         TransactionRequest::TransactionBuilder { builder } => {
@@ -975,18 +992,24 @@ fn build_tx(
                     None,
                 )
             } else {
-                let library = libraries(&binding.safe.safe_version).unwrap().0;
+                let (library, library_hash) = verified_library(
+                    &binding.chain,
+                    libraries(&binding.safe.safe_version).unwrap().0,
+                )?;
                 (
                     address(library.address, "MultiSendCallOnly")?,
                     U256::ZERO,
                     encode_batch(&calls, &binding.safe.safe_address)?,
                     1,
-                    Some(code_hash(&binding.chain, library)?),
+                    Some(library_hash),
                 )
             }
         }
         TransactionRequest::Create { value, initcode } => {
-            let library = libraries(&binding.safe.safe_version).unwrap().1;
+            let (library, library_hash) = verified_library(
+                &binding.chain,
+                libraries(&binding.safe.safe_version).unwrap().1,
+            )?;
             let data = performCreateCall {
                 value: uint(value, "value")?,
                 deploymentData: hex_bytes(initcode, "initcode")?.into(),
@@ -997,7 +1020,7 @@ fn build_tx(
                 U256::ZERO,
                 data,
                 1,
-                Some(code_hash(&binding.chain, library)?),
+                Some(library_hash),
             )
         }
         TransactionRequest::Create2 {
@@ -1005,7 +1028,10 @@ fn build_tx(
             initcode,
             salt,
         } => {
-            let library = libraries(&binding.safe.safe_version).unwrap().1;
+            let (library, library_hash) = verified_library(
+                &binding.chain,
+                libraries(&binding.safe.safe_version).unwrap().1,
+            )?;
             let salt = hex_bytes(salt, "salt")?;
             if salt.len() != 32 {
                 return Err(invalid("salt must be 32 bytes"));
@@ -1021,7 +1047,7 @@ fn build_tx(
                 U256::ZERO,
                 data,
                 1,
-                Some(code_hash(&binding.chain, library)?),
+                Some(library_hash),
             )
         }
         TransactionRequest::Rejection => (safe, U256::ZERO, vec![], 0, None),
@@ -1716,6 +1742,12 @@ mod tests {
 
     #[test]
     fn batch_encoding_is_call_only_and_bounded() {
+        let (multisend, create) = libraries("1.3.0").unwrap();
+        assert_eq!(multisend.len(), 2);
+        assert_eq!(create.len(), 2);
+        assert_eq!(libraries("1.4.1").unwrap().0.len(), 1);
+        assert!(libraries("1.2.0").is_none());
+
         let calls = vec![Call {
             to: "0x4000000000000000000000000000000000000000".into(),
             value: "2".into(),
