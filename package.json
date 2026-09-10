@@ -1,0 +1,11 @@
+{
+  "name": "bloom-petal-safe-integration-tests",
+  "private": true,
+  "scripts": {
+    "test:anvil": "node tests/anvil-proof.mjs"
+  },
+  "devDependencies": {
+    "@safe-global/safe-contracts": "1.4.1-2",
+    "ethers": "5.4.0"
+  }
+}

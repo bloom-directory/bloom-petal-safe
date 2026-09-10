@@ -1,0 +1,42 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install wasm-tools --version 1.255.0 --locked
+      - run: cargo test --manifest-path route/Cargo.toml
+      - run: cargo clippy --manifest-path route/Cargo.toml --all-targets -- -D warnings
+      - run: scripts/build.sh
+  anvil:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: npm ci
+      - run: forge build
+      - run: |
+          set -euo pipefail
+          anvil --port 18545 --silent &
+          anvil_pid=$!
+          trap 'kill "$anvil_pid"' EXIT
+          for _ in {1..40}; do
+            if cast block-number --rpc-url http://127.0.0.1:18545 >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.25
+          done
+          cast block-number --rpc-url http://127.0.0.1:18545 >/dev/null
+          npm run test:anvil

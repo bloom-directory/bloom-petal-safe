@@ -1,0 +1,17 @@
+schema = "bloom.petal.build.v1"
+name = "safe"
+routes = "route/files"
+output = "petal/safe"
+
+[route_crate]
+package = "safe-route"
+path = "route"
+alias = "example_route"
+
+[sdk]
+package = "bloom-petal-sdk"
+git = "https://github.com/bloom-directory/petal"
+rev = "9ad7a5c635f092bbcdf8f00a06b23676806ff70c"
+
+[dependencies]
+serde_json = "1"
