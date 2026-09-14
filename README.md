@@ -11,7 +11,7 @@ bloom petals install https://github.com/bloom-directory/bloom-petal-safe
 bloom petals ls
 ```
 
-The owner wallet policy must allow the Petal package and `destination = "exact"` on the numeric EVM chain, for example `chain = "evm-1"`. Configure an `evm-*` RPC in Bloom. To use a custom Transaction Service, configure the Petal endpoint binding `transaction-service` to the same HTTPS origin stored in the binding.
+The owner wallet policy must allow the Petal package and `destination = "exact"` on the EVM chain's configured Bloom name, for example `chain = "ethereum"`. To use a custom Transaction Service, configure the Petal endpoint binding `transaction-service` to the same HTTPS origin stored in the binding.
 
 ## Bind a Safe
 
@@ -19,7 +19,7 @@ Write this JSON to `petals/safe/safes/<wallet>/<safe-id>.json`:
 
 ```json
 {
-  "chain": "evm-1",
+  "chain": "ethereum",
   "safe_address": "0x...",
   "transaction_service": "https://safe-transaction-mainnet.safe.global"
 }

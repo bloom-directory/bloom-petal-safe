@@ -777,8 +777,14 @@ pub fn bind(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return invalid(format!("invalid binding JSON: {e}")),
     };
-    if !request.chain.starts_with("evm-") || request.chain.len() > 64 {
-        return invalid("chain must be a configured evm-* chain");
+    // Chains are addressed by their configured Bloom name (`base`,
+    // `ethereum`, `anvil`, ...); no prefix layer exists between the Petal and
+    // the daemon's chain registry.
+    if request.chain.is_empty()
+        || request.chain.len() > 64
+        || !petal::is_safe_segment(&request.chain)
+    {
+        return invalid("chain must be a configured Bloom chain name");
     }
     let owner = match wallet_address(wallet) {
         Ok(v) => v,
@@ -1696,6 +1702,17 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     }
 }
 
+/// Bloom's EVM outbox reports `pending`, `sent`, `success`, `reverted`,
+/// `failed`, or `cancelled`; a receipt's outcome is `success` or `reverted`.
+/// `success` is the only state that proves the Safe transaction executed.
+fn execution_phase(outbox_state: &str) -> Option<&'static str> {
+    match outbox_state {
+        "success" => Some("executed"),
+        "reverted" | "failed" => Some("execution_failed"),
+        _ => None,
+    }
+}
+
 pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
     {
@@ -1714,10 +1731,8 @@ pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
         if let Ok(inspection) = petal::sdk::tx_inspect(executor, &binding.chain, &outbox) {
             state.execution_status = Some(inspection.state.clone());
             state.execution_tx_hash = inspection.tx_hash;
-            if inspection.state == "confirmed" {
-                state.phase = "executed".into();
-            } else if inspection.state == "failed" {
-                state.phase = "execution_failed".into();
+            if let Some(phase) = execution_phase(&inspection.state) {
+                state.phase = phase.into();
             }
             let _ = save(&tx_key(wallet, id), &state);
         }
@@ -2008,7 +2023,7 @@ mod tests {
             schema: "bloom.safe.binding.v1".into(),
             wallet: "owner".into(),
             owner: snapshot.owners[0].clone(),
-            chain: "evm-31337".into(),
+            chain: "anvil".into(),
             safe: snapshot.clone(),
             transaction_service: None,
         };
@@ -2103,6 +2118,20 @@ mod tests {
             format!("{recovered:#x}"),
             "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
         );
+    }
+
+    #[test]
+    fn execution_phase_uses_the_outbox_state_vocabulary() {
+        // `confirmed` is not an EVM outbox state; matching it left executed
+        // transactions stuck in `execution_staged` and then mislabeled as
+        // `nonce_conflict` once the Safe nonce advanced.
+        assert!(execution_phase("confirmed").is_none());
+        assert_eq!(execution_phase("success"), Some("executed"));
+        assert_eq!(execution_phase("reverted"), Some("execution_failed"));
+        assert_eq!(execution_phase("failed"), Some("execution_failed"));
+        assert!(execution_phase("pending").is_none());
+        assert!(execution_phase("sent").is_none());
+        assert!(execution_phase("cancelled").is_none());
     }
 
     #[test]
