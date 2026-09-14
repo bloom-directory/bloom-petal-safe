@@ -1,0 +1,4 @@
+[profile.default]
+src = "tests/contracts"
+out = "target/forge"
+solc = "0.8.30"

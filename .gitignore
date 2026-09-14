@@ -1,0 +1,6 @@
+/petal/
+/target/
+/route/target/
+/node_modules/
+/cache/
+*.swp

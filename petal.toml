@@ -1,0 +1,29 @@
+schema = "bloom.petal.package.v1"
+name = "safe"
+
+[source]
+kind = "github"
+repository = "bloom-directory/bloom-petal-safe"
+
+[build]
+command = "scripts/build.sh"
+outputs = ["petal/safe"]
+
+[consent]
+summary = "Inspect, sign, coordinate, and execute bounded Safe smart-account transactions with Bloom-held owner and executor keys."
+
+[caps]
+allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:chain", "bloom:tx.outbox", "bloom:vfs.read"]
+
+[[net.allow]]
+binding = "transaction-service"
+host = "safe-transaction-mainnet.safe.global"
+methods = ["get", "post"]
+paths = ["/api/v1/*"]
+
+[sign]
+allowed_intents = ["safe.transaction.confirm"]
+
+[store]
+namespaces = ["state"]
+secret_namespaces = ["secrets"]
