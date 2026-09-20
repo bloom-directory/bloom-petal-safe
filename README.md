@@ -25,7 +25,7 @@ Write this JSON to `petals/safe/safes/<wallet>/<safe-id>.json`:
 }
 ```
 
-Bloom verifies code at the address, chain ID, singleton, `VERSION()`, owners, threshold, nonce, guard, all enabled modules (up to 64), and fallback handler. The Bloom wallet address must be a current owner. Read the same path to compare the bound configuration with current chain state.
+Bloom verifies code at the address, chain ID, singleton, `VERSION()`, owners, threshold, nonce, guard, all enabled modules (up to 64), and fallback handler. The Bloom wallet's account 0 EVM address (`wallets/<wallet>/0/address.evm`) must be a current owner. Read the same path to compare the bound configuration with current chain state.
 
 Hosted Safe Transaction Service API keys are optional and write-only:
 
