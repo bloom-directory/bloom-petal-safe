@@ -1744,9 +1744,16 @@ pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
         .ok()
         .and_then(|binding| inspect(&binding.chain, &binding.safe.safe_address).ok())
         .map(|snapshot| snapshot.nonce);
+    // While our own execution is in flight the nonce advancing is the expected
+    // outcome, not a conflict; only a failed or never-staged execution makes
+    // an advanced nonce mean someone else spent it.
+    let execution_in_flight = state.outbox_id.is_some()
+        && state.phase != "executed"
+        && state.phase != "execution_failed";
     let nonce_conflict = current_nonce.as_deref().is_some_and(|current| {
         uint(current, "current nonce").ok() > uint(&state.safe_tx.nonce, "transaction nonce").ok()
             && state.phase != "executed"
+            && !execution_in_flight
     });
     if nonce_conflict {
         state.phase = "nonce_conflict".into();
