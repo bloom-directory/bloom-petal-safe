@@ -1,1 +1,4 @@
-petal::route_file!(spec: petal::static_dir_spec(), list: petal::dir_names(&[]));
+petal::route_file!(
+    spec: petal::store_dir_spec().caps(&["bloom:store"]),
+    ctx_list: |_ctx: &petal::Ctx| Ok(petal::dirs(crate::service_key_wallets()?))
+);

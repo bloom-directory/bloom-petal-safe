@@ -35,6 +35,27 @@ petals/safe/service-keys/<wallet>/<safe-id>
 
 The value is stored in the Petal's secret namespace. It cannot be read through VFS.
 
+## Find what is already there
+
+Every directory lists what it holds, so nothing has to be remembered outside
+Bloom:
+
+```text
+petals/safe/safes/                       wallets holding a binding
+petals/safe/safes/<wallet>/              <safe-id>.json per bound Safe
+petals/safe/transactions/                wallets holding a transaction
+petals/safe/transactions/<wallet>/       one directory per transaction id
+petals/safe/service-keys/<wallet>/       Safes that have a service key set
+```
+
+The service-key listing projects record names only. The stored key is never
+read back, there or anywhere else.
+
+Reading `safes/<wallet>/<safe-id>.json` also returns `queue` and `history` for
+that Safe: every transaction this wallet drafted against it, ordered by Safe
+nonce, so two drafts competing for the same nonce are visible before either is
+signed.
+
 ## Draft
 
 Write `{"safe_id":"treasury","transaction":...}` to `petals/safe/transactions/<wallet>/<transaction-id>/draft.json`. Supported transaction bodies include:
@@ -51,6 +72,18 @@ Write `{"safe_id":"treasury","transaction":...}` to `petals/safe/transactions/<w
 ```
 
 Batches and multi-transaction Builder files use only the pinned canonical `MultiSendCallOnly`. Builder entries may contain raw `data` or a standard `contractMethod` plus `contractInputsValues`; Bloom ABI-encodes scalar, array, and tuple inputs and rejects missing, extra, or invalid values. Deployments use only the pinned canonical `CreateCall`. The Petal reads and hashes the runtime code before drafting. Arbitrary delegatecalls and Safe self-calls are rejected. Refund fields are fixed to zero.
+
+## Read the plan
+
+`.../<transaction-id>/plan.md` renders one drafted transaction: the decoded
+action, the exact fields that get signed, how many signatures the threshold
+still needs and from which owners, and the next step for the current phase.
+
+It reads stored state only. The Safe configuration it shows is what was
+recorded when the transaction was drafted, not a fresh observation, and the
+file says so. `status.json` is the live view. Reading the plan starts no
+ceremony and signs nothing: Broker's own reconstruction during the approval
+ceremony, not this file, is what authorizes a signature.
 
 ## Confirm and propose
 
