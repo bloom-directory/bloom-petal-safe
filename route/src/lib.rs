@@ -555,7 +555,8 @@ fn encode_builder_method(
 
 fn wallet_address(wallet: &str) -> Result<String, DispatchResponse> {
     let bytes =
-        petal::sdk::vfs_read(&format!("wallets/{wallet}/address"), 128).map_err(sdk_error)?;
+        // Account 0 is the key exact signing uses when no key ref is named.
+        petal::sdk::vfs_read(&format!("wallets/{wallet}/0/address.evm"), 128).map_err(sdk_error)?;
     let value = std::str::from_utf8(&bytes)
         .map_err(|_| backend("wallet address is not UTF-8"))?
         .trim();
@@ -569,7 +570,9 @@ fn tx_key(wallet: &str, id: &str) -> String {
     format!("state/transactions/{wallet}/{id}.json")
 }
 fn api_key_key(wallet: &str, safe_id: &str) -> String {
-    format!("secrets/services/{wallet}/{safe_id}.txt")
+    // The SDK reads `creds/` keys from the secret namespace; any other prefix
+    // reads state, so a key stored as a secret could never be read back.
+    format!("creds/services/{wallet}/{safe_id}.txt")
 }
 
 fn load<T: for<'de> Deserialize<'de>>(key: &str, label: &str) -> Result<T, DispatchResponse> {
@@ -1741,9 +1744,16 @@ pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
         .ok()
         .and_then(|binding| inspect(&binding.chain, &binding.safe.safe_address).ok())
         .map(|snapshot| snapshot.nonce);
+    // While our own execution is in flight the nonce advancing is the expected
+    // outcome, not a conflict; only a failed or never-staged execution makes
+    // an advanced nonce mean someone else spent it.
+    let execution_in_flight = state.outbox_id.is_some()
+        && state.phase != "executed"
+        && state.phase != "execution_failed";
     let nonce_conflict = current_nonce.as_deref().is_some_and(|current| {
         uint(current, "current nonce").ok() > uint(&state.safe_tx.nonce, "transaction nonce").ok()
             && state.phase != "executed"
+            && !execution_in_flight
     });
     if nonce_conflict {
         state.phase = "nonce_conflict".into();
@@ -1796,6 +1806,12 @@ mod tests {
             refund_receiver: ZERO.into(),
             nonce: "4".into(),
         }
+    }
+
+    #[test]
+    fn service_key_is_stored_where_the_sdk_reads_secrets() {
+        // `store_get` only consults the secret namespace for `creds/` keys.
+        assert!(api_key_key("owner", "treasury").starts_with("creds/"));
     }
 
     #[test]
