@@ -1451,9 +1451,49 @@ fn service(
         MAX_BODY,
     )
     .map_err(sdk_error)?;
-    let value = serde_json::from_slice(&response.body)
-        .map_err(|e| backend(format!("Transaction Service returned invalid JSON: {e}")))?;
+    let value = service_body(response.status, &response.body)?;
     Ok((response.status, value))
+}
+
+/// A created proposal comes back as `201` with no body, and a refusal may
+/// not be JSON at all; only a successful body has to parse.
+fn service_body(status: u16, body: &[u8]) -> Result<Value, DispatchResponse> {
+    if body.is_empty() {
+        return Ok(Value::Null);
+    }
+    match serde_json::from_slice(body) {
+        Ok(value) => Ok(value),
+        Err(_) if !(200..300).contains(&status) => {
+            Ok(Value::String(String::from_utf8_lossy(body).into_owned()))
+        }
+        Err(e) => Err(backend(format!(
+            "Transaction Service returned invalid JSON: {e}"
+        ))),
+    }
+}
+
+/// Name the service's own reason, bounded and printable: it is untrusted
+/// text, but without it a refused proposal cannot be diagnosed.
+fn service_failure(action: &str, status: u16, value: &Value) -> DispatchResponse {
+    let text = match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        value => value.to_string(),
+    };
+    let reason: String = text
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(240)
+        .collect();
+    if reason.is_empty() {
+        backend(format!(
+            "Transaction Service {action} failed with status {status}"
+        ))
+    } else {
+        backend(format!(
+            "Transaction Service {action} failed with status {status}: {reason}"
+        ))
+    }
 }
 
 fn service_tx_matches(value: &Value, state: &TransactionState) -> bool {
@@ -1513,7 +1553,7 @@ fn publish(binding: &Binding, state: &TransactionState) -> Result<String, Dispat
             ));
         }
         let confirm_path = format!("/api/v1/multisig-transactions/{hash}/confirmations/");
-        let (status, _) = service(
+        let (status, value) = service(
             binding,
             &state.safe_id,
             "POST",
@@ -1521,19 +1561,15 @@ fn publish(binding: &Binding, state: &TransactionState) -> Result<String, Dispat
             serde_json::to_vec(&json!({"signature":state.owner_signature})).unwrap(),
         )?;
         if !(200..300).contains(&status) {
-            return Err(backend(format!(
-                "Transaction Service confirmation failed with status {status}"
-            )));
+            return Err(service_failure("confirmation", status, &value));
         }
         return Ok("confirmed".into());
     }
     if status != 404 {
-        return Err(backend(format!(
-            "Transaction Service lookup failed with status {status}"
-        )));
+        return Err(service_failure("lookup", status, &value));
     }
     let (path, body) = proposal(binding, state)?;
-    let (status, _) = service(
+    let (status, value) = service(
         binding,
         &state.safe_id,
         "POST",
@@ -1541,9 +1577,7 @@ fn publish(binding: &Binding, state: &TransactionState) -> Result<String, Dispat
         serde_json::to_vec(&body).unwrap(),
     )?;
     if !(200..300).contains(&status) {
-        return Err(backend(format!(
-            "Transaction Service proposal failed with status {status}"
-        )));
+        return Err(service_failure("proposal", status, &value));
     }
     Ok("proposed".into())
 }
@@ -1999,6 +2033,33 @@ mod tests {
         assert_eq!(body["sender"], "0x977667F2D703138D8C8419531BCBE177c2D78c7d");
         assert_eq!(body["gasToken"], ZERO);
         assert_eq!(body["refundReceiver"], ZERO);
+    }
+
+    #[test]
+    fn service_bodies_accept_an_empty_created_response_and_keep_refusal_reasons() {
+        assert_eq!(service_body(201, b"").unwrap(), Value::Null);
+        assert!(service_body(200, b"<html>").is_err());
+        assert_eq!(
+            service_body(502, b"<html>bad gateway</html>").unwrap(),
+            json!("<html>bad gateway</html>")
+        );
+        let refusal = service_body(
+            422,
+            br#"{"code":1,"message":"Checksum address validation failed"}"#,
+        )
+        .unwrap();
+        let DispatchResponse::Error { message, .. } = service_failure("proposal", 422, &refusal)
+        else {
+            panic!("a refusal must be an error");
+        };
+        assert!(message.contains("status 422"));
+        assert!(message.contains("Checksum address validation failed"));
+        let DispatchResponse::Error { message, .. } =
+            service_failure("proposal", 500, &json!("line\nbreak\u{7}"))
+        else {
+            panic!("a refusal must be an error");
+        };
+        assert!(message.ends_with("status 500: linebreak"));
     }
 
     #[test]
