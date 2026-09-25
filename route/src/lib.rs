@@ -1482,6 +1482,26 @@ fn service_tx_matches(value: &Value, state: &TransactionState) -> bool {
         && field("safeTxHash").is_some_and(|v| v.eq_ignore_ascii_case(&state.safe_tx_hash))
 }
 
+/// The hosted Transaction Service refuses any address that is not EIP-55
+/// checksummed, in the path and in the body alike.
+fn proposal(
+    binding: &Binding,
+    state: &TransactionState,
+) -> Result<(String, Value), DispatchResponse> {
+    let checksum = |value: &str, field: &str| Ok(address(value, field)?.to_checksum(None));
+    let safe = checksum(&binding.safe.safe_address, "safe")?;
+    let body = json!({
+        "safe":safe,"to":checksum(&state.safe_tx.to, "to")?,"value":state.safe_tx.value,"data":state.safe_tx.data,
+        "operation":state.safe_tx.operation,"gasToken":checksum(&state.safe_tx.gas_token, "gasToken")?,
+        "safeTxGas":state.safe_tx.safe_tx_gas,"baseGas":state.safe_tx.base_gas,"gasPrice":state.safe_tx.gas_price,
+        "refundReceiver":checksum(&state.safe_tx.refund_receiver, "refundReceiver")?,
+        "nonce":state.safe_tx.nonce,"contractTransactionHash":state.safe_tx_hash,
+        "sender":checksum(&binding.owner, "sender")?,
+        "signature":state.owner_signature,"origin":"Bloom Safe Petal"
+    });
+    Ok((format!("/api/v1/safes/{safe}/multisig-transactions/"), body))
+}
+
 fn publish(binding: &Binding, state: &TransactionState) -> Result<String, DispatchResponse> {
     let hash = &state.safe_tx_hash;
     let path = format!("/api/v1/multisig-transactions/{hash}/");
@@ -1512,17 +1532,7 @@ fn publish(binding: &Binding, state: &TransactionState) -> Result<String, Dispat
             "Transaction Service lookup failed with status {status}"
         )));
     }
-    let path = format!(
-        "/api/v1/safes/{}/multisig-transactions/",
-        binding.safe.safe_address
-    );
-    let body = json!({
-        "safe":binding.safe.safe_address,"to":state.safe_tx.to,"value":state.safe_tx.value,"data":state.safe_tx.data,
-        "operation":state.safe_tx.operation,"gasToken":state.safe_tx.gas_token,"safeTxGas":state.safe_tx.safe_tx_gas,
-        "baseGas":state.safe_tx.base_gas,"gasPrice":state.safe_tx.gas_price,"refundReceiver":state.safe_tx.refund_receiver,
-        "nonce":state.safe_tx.nonce,"contractTransactionHash":state.safe_tx_hash,"sender":binding.owner,
-        "signature":state.owner_signature,"origin":"Bloom Safe Petal"
-    });
+    let (path, body) = proposal(binding, state)?;
     let (status, _) = service(
         binding,
         &state.safe_id,
@@ -1963,6 +1973,32 @@ mod tests {
         response["gasPrice"] = json!(0);
         response["refundReceiver"] = json!("0x4000000000000000000000000000000000000000");
         assert!(!service_tx_matches(&response, &state));
+
+        // Stored addresses are lowercase; the hosted service answers 422 to
+        // anything that is not EIP-55, in the path and in the body.
+        let mut state = state;
+        state.safe_tx.to = "0x9f5bc439b96c8fd003b640525fea3fa0b26501c2".into();
+        let binding = Binding {
+            schema: "bloom.safe.binding.v1".into(),
+            wallet: "owner".into(),
+            owner: "0x977667f2d703138d8c8419531bcbe177c2d78c7d".into(),
+            chain: "ethereum".into(),
+            safe: SafeSnapshot {
+                safe_address: "0x220866b1a2219f40e72f5c628b65d54268ca3a9d".into(),
+                ..state.snapshot.clone()
+            },
+            transaction_service: Some("https://api.safe.global/tx-service/eth".into()),
+        };
+        let (path, body) = proposal(&binding, &state).unwrap();
+        assert_eq!(
+            path,
+            "/api/v1/safes/0x220866B1A2219f40e72f5c628B65D54268cA3A9D/multisig-transactions/"
+        );
+        assert_eq!(body["safe"], "0x220866B1A2219f40e72f5c628B65D54268cA3A9D");
+        assert_eq!(body["to"], "0x9F5bc439B96c8Fd003b640525fEA3FA0B26501c2");
+        assert_eq!(body["sender"], "0x977667F2D703138D8C8419531BCBE177c2D78c7d");
+        assert_eq!(body["gasToken"], ZERO);
+        assert_eq!(body["refundReceiver"], ZERO);
     }
 
     #[test]
