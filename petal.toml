@@ -17,9 +17,9 @@ allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:chain", "bloom:tx.o
 
 [[net.allow]]
 binding = "transaction-service"
-host = "safe-transaction-mainnet.safe.global"
+host = "api.safe.global"
 methods = ["get", "post"]
-paths = ["/api/v1/*"]
+paths = ["/tx-service/*", "/api/v1/*"]
 
 [sign]
 allowed_intents = ["safe.transaction.confirm"]

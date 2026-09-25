@@ -748,21 +748,40 @@ fn inspect(chain: &str, safe: &str) -> Result<SafeSnapshot, DispatchResponse> {
     })
 }
 
+/// A Transaction Service base URL: an HTTPS origin, optionally followed by a
+/// fixed path prefix such as Safe's hosted `/tx-service/eth`. No userinfo,
+/// query, fragment or dot segments, so the base cannot smuggle a request
+/// elsewhere; the host is still bounded by the manifest's `net.allow`.
 fn validate_service(value: Option<String>) -> Result<Option<String>, DispatchResponse> {
     value
         .map(|mut value| {
             while value.ends_with('/') {
                 value.pop();
             }
-            let authority = value.strip_prefix("https://").unwrap_or_default();
+            let rest = value.strip_prefix("https://").unwrap_or_default();
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let path_valid = path.is_empty()
+                || path.split('/').count() <= 8
+                    && path.split('/').all(|segment| {
+                        !segment.is_empty()
+                            && segment.bytes().any(|byte| byte.is_ascii_alphanumeric())
+                            && segment.bytes().all(|byte| {
+                                byte.is_ascii_lowercase()
+                                    || byte.is_ascii_digit()
+                                    || matches!(byte, b'-' | b'_')
+                            })
+                    });
             if authority.is_empty()
                 || value.len() > 255
+                || !path_valid
                 || !authority.bytes().any(|byte| byte.is_ascii_alphanumeric())
                 || !authority.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
                 })
             {
-                return Err(invalid("transaction_service must be an HTTPS origin"));
+                return Err(invalid(
+                    "transaction_service must be an HTTPS origin with an optional path prefix",
+                ));
             }
             Ok(value)
         })
@@ -1880,11 +1899,20 @@ mod tests {
             validate_service(Some("https://safe.example/".into())).unwrap(),
             Some("https://safe.example".into())
         );
+        assert_eq!(
+            validate_service(Some("https://api.safe.global/tx-service/eth/".into())).unwrap(),
+            Some("https://api.safe.global/tx-service/eth".into())
+        );
         for invalid in [
             "http://safe.example",
             "https://user@safe.example",
-            "https://safe.example/api",
             "https://safe.example?token=value",
+            "https://safe.example/api?token=value",
+            "https://safe.example/api#fragment",
+            "https://safe.example/../other",
+            "https://safe.example/tx-service//eth",
+            "https://safe.example/tx-service/ETH",
+            "https:///tx-service/eth",
         ] {
             assert!(validate_service(Some(invalid.into())).is_err());
         }
