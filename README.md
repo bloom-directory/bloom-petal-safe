@@ -11,7 +11,7 @@ bloom petals install https://github.com/bloom-directory/bloom-petal-safe
 bloom petals ls
 ```
 
-The owner wallet policy must allow the Petal package and carry `{"chain": "evm-<chain id>", "destination": "exact"}` (Broker keys Safe signing by chain id, for example `evm-1` for Ethereum mainnet). The executor wallet policy must allow the Safe address as a destination on the chain's configured Bloom name, for example `{"chain": "ethereum", "destination": "0x<safe>"}`, because the outer `execTransaction` goes through Bloom's native outbox. To use a self-hosted Transaction Service, configure the Petal endpoint binding `transaction-service` to its HTTPS origin and store the same origin in the binding; it must serve `/api/v1/` at the root.
+The owner wallet policy must allow the Petal package and carry `{"chain": "evm-<chain id>", "destination": "exact"}` (Broker keys Safe signing by chain id, for example `evm-1` for Ethereum mainnet). The executor wallet policy must allow the Safe address as a destination on the chain's configured Bloom name, for example `{"chain": "ethereum", "destination": "0x<safe>"}`, because the outer `execTransaction` goes through Bloom's native outbox. It must also allow the Petal package, since the Petal stages that entry; if it does not, the first confirm opens a policy-update ceremony that adds it. To use a self-hosted Transaction Service, configure the Petal endpoint binding `transaction-service` to its HTTPS origin and store the same origin in the binding; it must serve `/api/v1/` at the root.
 
 ## Bind a Safe
 
@@ -79,7 +79,7 @@ Write to `.../<transaction-id>/execute.json`:
 
 When a Transaction Service is configured, confirmations are fetched automatically. Otherwise, add 65-byte EOA owner signatures to `signatures`. Every signature is recovered against `safeTxHash`, checked against current owners, deduplicated, sorted by owner address, and threshold checked. Contract signatures are intentionally unsupported in this release.
 
-The encoded `execTransaction` is staged in Bloom's native EVM outbox and requires the normal executor-wallet approval. Confirm that outbox entry as the executor wallet, then read `.../<transaction-id>/execute.json` to reconcile it: Bloom scopes outbox inspection to the route that staged the entry, so only the execute route can observe the receipt. Every other read of the transaction returns the last reconciled state.
+The encoded `execTransaction` is staged in Bloom's native EVM outbox and requires the normal executor-wallet approval. Confirm that outbox entry as the executor wallet (`bloom wallet confirm <executor> <chain> <outbox_id>`, with `outbox_id` from `status.json`), then read `.../<transaction-id>/execute.json` until its `phase` is `executed` or `execution_failed` to reconcile it: Bloom scopes outbox inspection to the route that staged the entry, so only the execute route can observe the receipt. Every other read of the transaction returns the last reconciled state.
 
 ## Hash lifecycle
 
