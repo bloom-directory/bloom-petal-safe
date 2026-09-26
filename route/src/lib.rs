@@ -1474,13 +1474,39 @@ fn service_body(status: u16, body: &[u8]) -> Result<Value, DispatchResponse> {
 
 /// Name the service's own reason, bounded and printable: it is untrusted
 /// text, but without it a refused proposal cannot be diagnosed.
+/// A refusal may echo what was sent. Addresses (40 hex digits) and hashes
+/// (64) name what went wrong; anything longer, such as a 65-byte owner
+/// signature, stays out of messages and logs.
+fn redact_long_hex(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() > 64 {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_hexdigit() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 fn service_failure(action: &str, status: u16, value: &Value) -> DispatchResponse {
     let text = match value {
         Value::Null => String::new(),
         Value::String(text) => text.clone(),
         value => value.to_string(),
     };
-    let reason: String = text
+    let reason: String = redact_long_hex(&text)
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .take(240)
@@ -2060,6 +2086,16 @@ mod tests {
             panic!("a refusal must be an error");
         };
         assert!(message.ends_with("status 500: linebreak"));
+        // A 65-byte signature echoed back is redacted; an address is kept.
+        let signature = format!("0x{}", "ab".repeat(65));
+        let echoed = json!({"signature": [format!("{signature} is invalid for 0x977667F2D703138D8C8419531BCBE177c2D78c7d")]});
+        let DispatchResponse::Error { message, .. } = service_failure("proposal", 422, &echoed)
+        else {
+            panic!("a refusal must be an error");
+        };
+        assert!(!message.contains(&signature[2..]));
+        assert!(message.contains("0x[redacted] is invalid"));
+        assert!(message.contains("0x977667F2D703138D8C8419531BCBE177c2D78c7d"));
     }
 
     #[test]
