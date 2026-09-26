@@ -825,21 +825,40 @@ fn inspect(chain: &str, safe: &str) -> Result<SafeSnapshot, DispatchResponse> {
     })
 }
 
+/// A Transaction Service base URL: an HTTPS origin, optionally followed by a
+/// fixed path prefix such as Safe's hosted `/tx-service/eth`. No userinfo,
+/// query, fragment or dot segments, so the base cannot smuggle a request
+/// elsewhere; the host is still bounded by the manifest's `net.allow`.
 fn validate_service(value: Option<String>) -> Result<Option<String>, DispatchResponse> {
     value
         .map(|mut value| {
             while value.ends_with('/') {
                 value.pop();
             }
-            let authority = value.strip_prefix("https://").unwrap_or_default();
+            let rest = value.strip_prefix("https://").unwrap_or_default();
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let path_valid = path.is_empty()
+                || path.split('/').count() <= 8
+                    && path.split('/').all(|segment| {
+                        !segment.is_empty()
+                            && segment.bytes().any(|byte| byte.is_ascii_alphanumeric())
+                            && segment.bytes().all(|byte| {
+                                byte.is_ascii_lowercase()
+                                    || byte.is_ascii_digit()
+                                    || matches!(byte, b'-' | b'_')
+                            })
+                    });
             if authority.is_empty()
                 || value.len() > 255
+                || !path_valid
                 || !authority.bytes().any(|byte| byte.is_ascii_alphanumeric())
                 || !authority.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
                 })
             {
-                return Err(invalid("transaction_service must be an HTTPS origin"));
+                return Err(invalid(
+                    "transaction_service must be an HTTPS origin with an optional path prefix",
+                ));
             }
             Ok(value)
         })
@@ -1528,9 +1547,75 @@ fn service(
         MAX_BODY,
     )
     .map_err(sdk_error)?;
-    let value = serde_json::from_slice(&response.body)
-        .map_err(|e| backend(format!("Transaction Service returned invalid JSON: {e}")))?;
+    let value = service_body(response.status, &response.body)?;
     Ok((response.status, value))
+}
+
+/// A created proposal comes back as `201` with no body, and a refusal may
+/// not be JSON at all; only a successful body has to parse.
+fn service_body(status: u16, body: &[u8]) -> Result<Value, DispatchResponse> {
+    if body.is_empty() {
+        return Ok(Value::Null);
+    }
+    match serde_json::from_slice(body) {
+        Ok(value) => Ok(value),
+        Err(_) if !(200..300).contains(&status) => {
+            Ok(Value::String(String::from_utf8_lossy(body).into_owned()))
+        }
+        Err(e) => Err(backend(format!(
+            "Transaction Service returned invalid JSON: {e}"
+        ))),
+    }
+}
+
+/// Name the service's own reason, bounded and printable: it is untrusted
+/// text, but without it a refused proposal cannot be diagnosed.
+/// A refusal may echo what was sent. Addresses (40 hex digits) and hashes
+/// (64) name what went wrong; anything longer, such as a 65-byte owner
+/// signature, stays out of messages and logs.
+fn redact_long_hex(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() > 64 {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_hexdigit() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+fn service_failure(action: &str, status: u16, value: &Value) -> DispatchResponse {
+    let text = match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        value => value.to_string(),
+    };
+    let reason: String = redact_long_hex(&text)
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(240)
+        .collect();
+    if reason.is_empty() {
+        backend(format!(
+            "Transaction Service {action} failed with status {status}"
+        ))
+    } else {
+        backend(format!(
+            "Transaction Service {action} failed with status {status}: {reason}"
+        ))
+    }
 }
 
 fn service_tx_matches(value: &Value, state: &TransactionState) -> bool {
@@ -1559,6 +1644,26 @@ fn service_tx_matches(value: &Value, state: &TransactionState) -> bool {
         && field("safeTxHash").is_some_and(|v| v.eq_ignore_ascii_case(&state.safe_tx_hash))
 }
 
+/// The hosted Transaction Service refuses any address that is not EIP-55
+/// checksummed, in the path and in the body alike.
+fn proposal(
+    binding: &Binding,
+    state: &TransactionState,
+) -> Result<(String, Value), DispatchResponse> {
+    let checksum = |value: &str, field: &str| Ok(address(value, field)?.to_checksum(None));
+    let safe = checksum(&binding.safe.safe_address, "safe")?;
+    let body = json!({
+        "safe":safe,"to":checksum(&state.safe_tx.to, "to")?,"value":state.safe_tx.value,"data":state.safe_tx.data,
+        "operation":state.safe_tx.operation,"gasToken":checksum(&state.safe_tx.gas_token, "gasToken")?,
+        "safeTxGas":state.safe_tx.safe_tx_gas,"baseGas":state.safe_tx.base_gas,"gasPrice":state.safe_tx.gas_price,
+        "refundReceiver":checksum(&state.safe_tx.refund_receiver, "refundReceiver")?,
+        "nonce":state.safe_tx.nonce,"contractTransactionHash":state.safe_tx_hash,
+        "sender":checksum(&binding.owner, "sender")?,
+        "signature":state.owner_signature,"origin":"Bloom Safe Petal"
+    });
+    Ok((format!("/api/v1/safes/{safe}/multisig-transactions/"), body))
+}
+
 fn publish(binding: &Binding, state: &TransactionState) -> Result<String, DispatchResponse> {
     let hash = &state.safe_tx_hash;
     let path = format!("/api/v1/multisig-transactions/{hash}/");
@@ -1570,7 +1675,7 @@ fn publish(binding: &Binding, state: &TransactionState) -> Result<String, Dispat
             ));
         }
         let confirm_path = format!("/api/v1/multisig-transactions/{hash}/confirmations/");
-        let (status, _) = service(
+        let (status, value) = service(
             binding,
             &state.safe_id,
             "POST",
@@ -1578,29 +1683,15 @@ fn publish(binding: &Binding, state: &TransactionState) -> Result<String, Dispat
             serde_json::to_vec(&json!({"signature":state.owner_signature})).unwrap(),
         )?;
         if !(200..300).contains(&status) {
-            return Err(backend(format!(
-                "Transaction Service confirmation failed with status {status}"
-            )));
+            return Err(service_failure("confirmation", status, &value));
         }
         return Ok("confirmed".into());
     }
     if status != 404 {
-        return Err(backend(format!(
-            "Transaction Service lookup failed with status {status}"
-        )));
+        return Err(service_failure("lookup", status, &value));
     }
-    let path = format!(
-        "/api/v1/safes/{}/multisig-transactions/",
-        binding.safe.safe_address
-    );
-    let body = json!({
-        "safe":binding.safe.safe_address,"to":state.safe_tx.to,"value":state.safe_tx.value,"data":state.safe_tx.data,
-        "operation":state.safe_tx.operation,"gasToken":state.safe_tx.gas_token,"safeTxGas":state.safe_tx.safe_tx_gas,
-        "baseGas":state.safe_tx.base_gas,"gasPrice":state.safe_tx.gas_price,"refundReceiver":state.safe_tx.refund_receiver,
-        "nonce":state.safe_tx.nonce,"contractTransactionHash":state.safe_tx_hash,"sender":binding.owner,
-        "signature":state.owner_signature,"origin":"Bloom Safe Petal"
-    });
-    let (status, _) = service(
+    let (path, body) = proposal(binding, state)?;
+    let (status, value) = service(
         binding,
         &state.safe_id,
         "POST",
@@ -1608,9 +1699,7 @@ fn publish(binding: &Binding, state: &TransactionState) -> Result<String, Dispat
         serde_json::to_vec(&body).unwrap(),
     )?;
     if !(200..300).contains(&status) {
-        return Err(backend(format!(
-            "Transaction Service proposal failed with status {status}"
-        )));
+        return Err(service_failure("proposal", status, &value));
     }
     Ok("proposed".into())
 }
@@ -2381,11 +2470,20 @@ mod tests {
             validate_service(Some("https://safe.example/".into())).unwrap(),
             Some("https://safe.example".into())
         );
+        assert_eq!(
+            validate_service(Some("https://api.safe.global/tx-service/eth/".into())).unwrap(),
+            Some("https://api.safe.global/tx-service/eth".into())
+        );
         for invalid in [
             "http://safe.example",
             "https://user@safe.example",
-            "https://safe.example/api",
             "https://safe.example?token=value",
+            "https://safe.example/api?token=value",
+            "https://safe.example/api#fragment",
+            "https://safe.example/../other",
+            "https://safe.example/tx-service//eth",
+            "https://safe.example/tx-service/ETH",
+            "https:///tx-service/eth",
         ] {
             assert!(validate_service(Some(invalid.into())).is_err());
         }
@@ -2436,6 +2534,69 @@ mod tests {
         response["gasPrice"] = json!(0);
         response["refundReceiver"] = json!("0x4000000000000000000000000000000000000000");
         assert!(!service_tx_matches(&response, &state));
+
+        // Stored addresses are lowercase; the hosted service answers 422 to
+        // anything that is not EIP-55, in the path and in the body.
+        let mut state = state;
+        state.safe_tx.to = "0x9f5bc439b96c8fd003b640525fea3fa0b26501c2".into();
+        let binding = Binding {
+            schema: "bloom.safe.binding.v1".into(),
+            wallet: "owner".into(),
+            owner: "0x977667f2d703138d8c8419531bcbe177c2d78c7d".into(),
+            chain: "ethereum".into(),
+            safe: SafeSnapshot {
+                safe_address: "0x220866b1a2219f40e72f5c628b65d54268ca3a9d".into(),
+                ..state.snapshot.clone()
+            },
+            transaction_service: Some("https://api.safe.global/tx-service/eth".into()),
+        };
+        let (path, body) = proposal(&binding, &state).unwrap();
+        assert_eq!(
+            path,
+            "/api/v1/safes/0x220866B1A2219f40e72f5c628B65D54268cA3A9D/multisig-transactions/"
+        );
+        assert_eq!(body["safe"], "0x220866B1A2219f40e72f5c628B65D54268cA3A9D");
+        assert_eq!(body["to"], "0x9F5bc439B96c8Fd003b640525fEA3FA0B26501c2");
+        assert_eq!(body["sender"], "0x977667F2D703138D8C8419531BCBE177c2D78c7d");
+        assert_eq!(body["gasToken"], ZERO);
+        assert_eq!(body["refundReceiver"], ZERO);
+    }
+
+    #[test]
+    fn service_bodies_accept_an_empty_created_response_and_keep_refusal_reasons() {
+        assert_eq!(service_body(201, b"").unwrap(), Value::Null);
+        assert!(service_body(200, b"<html>").is_err());
+        assert_eq!(
+            service_body(502, b"<html>bad gateway</html>").unwrap(),
+            json!("<html>bad gateway</html>")
+        );
+        let refusal = service_body(
+            422,
+            br#"{"code":1,"message":"Checksum address validation failed"}"#,
+        )
+        .unwrap();
+        let DispatchResponse::Error { message, .. } = service_failure("proposal", 422, &refusal)
+        else {
+            panic!("a refusal must be an error");
+        };
+        assert!(message.contains("status 422"));
+        assert!(message.contains("Checksum address validation failed"));
+        let DispatchResponse::Error { message, .. } =
+            service_failure("proposal", 500, &json!("line\nbreak\u{7}"))
+        else {
+            panic!("a refusal must be an error");
+        };
+        assert!(message.ends_with("status 500: linebreak"));
+        // A 65-byte signature echoed back is redacted; an address is kept.
+        let signature = format!("0x{}", "ab".repeat(65));
+        let echoed = json!({"signature": [format!("{signature} is invalid for 0x977667F2D703138D8C8419531BCBE177c2D78c7d")]});
+        let DispatchResponse::Error { message, .. } = service_failure("proposal", 422, &echoed)
+        else {
+            panic!("a refusal must be an error");
+        };
+        assert!(!message.contains(&signature[2..]));
+        assert!(message.contains("0x[redacted] is invalid"));
+        assert!(message.contains("0x977667F2D703138D8C8419531BCBE177c2D78c7d"));
     }
 
     #[test]

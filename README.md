@@ -11,7 +11,7 @@ bloom petals install https://github.com/bloom-directory/bloom-petal-safe
 bloom petals ls
 ```
 
-The owner wallet policy must allow the Petal package and carry `{"chain": "evm-<chain id>", "destination": "exact"}` (Broker keys Safe signing by chain id, for example `evm-1` for Ethereum mainnet). The executor wallet policy must allow the Safe address as a destination on the chain's configured Bloom name, for example `{"chain": "ethereum", "destination": "0x<safe>"}`, because the outer `execTransaction` goes through Bloom's native outbox. To use a custom Transaction Service, configure the Petal endpoint binding `transaction-service` to the same HTTPS origin stored in the binding.
+The owner wallet policy must allow the Petal package and carry `{"chain": "evm-<chain id>", "destination": "exact"}` (Broker keys Safe signing by chain id, for example `evm-1` for Ethereum mainnet). The executor wallet policy must allow the Safe address as a destination on the chain's configured Bloom name, for example `{"chain": "ethereum", "destination": "0x<safe>"}`, because the outer `execTransaction` goes through Bloom's native outbox. It must also allow the Petal package, since the Petal stages that entry; if it does not, the first confirm opens a policy-update ceremony that adds it. To use a self-hosted Transaction Service, configure the Petal endpoint binding `transaction-service` to its HTTPS origin and store the same origin in the binding; it must serve `/api/v1/` at the root.
 
 ## Bind a Safe
 
@@ -21,9 +21,15 @@ Write this JSON to `petals/safe/safes/<wallet>/<safe-id>.json`:
 {
   "chain": "ethereum",
   "safe_address": "0x...",
-  "transaction_service": "https://safe-transaction-mainnet.safe.global"
+  "transaction_service": "https://api.safe.global/tx-service/eth"
 }
 ```
+
+`transaction_service` is optional. Safe's hosted service is
+`https://api.safe.global/tx-service/<slug>`, for example `eth`, `base`, `arb1`,
+`oeth`, `gno` or `sep`. The old `safe-transaction-<network>.safe.global` hosts
+now redirect there, and Bloom does not follow redirects to an undeclared host,
+so bind the new base directly. Omit the field to collect signatures offline.
 
 Bloom verifies code at the address, chain ID, singleton, `VERSION()`, owners, threshold, nonce, guard, all enabled modules (up to 64), and fallback handler. The Bloom wallet's account 0 EVM address (`wallets/<wallet>/0/address.evm`) must be a current owner. Read the same path to compare the bound configuration with current chain state.
 
@@ -109,7 +115,7 @@ Write to `.../<transaction-id>/execute.json`:
 
 When a Transaction Service is configured, confirmations are fetched automatically. Otherwise, add 65-byte EOA owner signatures to `signatures`. Every signature is recovered against `safeTxHash`, checked against current owners, deduplicated, sorted by owner address, and threshold checked. Contract signatures are intentionally unsupported in this release.
 
-The encoded `execTransaction` is staged in Bloom's native EVM outbox and requires the normal executor-wallet approval. Confirm that outbox entry as the executor wallet, then read `.../<transaction-id>/execute.json` to reconcile it: Bloom scopes outbox inspection to the route that staged the entry, so only the execute route can observe the receipt. Every other read of the transaction returns the last reconciled state.
+The encoded `execTransaction` is staged in Bloom's native EVM outbox and requires the normal executor-wallet approval. Confirm that outbox entry as the executor wallet (`bloom wallet confirm <executor> <chain> <outbox_id>`, with `outbox_id` from `status.json`), then read `.../<transaction-id>/execute.json` until its `phase` is `executed` or `execution_failed` to reconcile it: Bloom scopes outbox inspection to the route that staged the entry, so only the execute route can observe the receipt. Every other read of the transaction returns the last reconciled state.
 
 If the outer transaction reverts or fails, `execute.json` reads `execution_failed`. Write `execute.json` again to stage a new attempt; Bloom refuses it once the Safe nonce has moved.
 
