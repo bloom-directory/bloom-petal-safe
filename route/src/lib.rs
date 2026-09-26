@@ -907,10 +907,14 @@ pub fn read_binding(wallet: &str, safe_id: &str) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let projection = match queue_and_history(wallet, safe_id) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    // The binding stays readable when the transaction listing is not: the
+    // projection then reports itself incomplete instead of failing the read.
+    let projection = queue_and_history(wallet, safe_id).unwrap_or(QueueProjection {
+        queue: Vec::new(),
+        history: Vec::new(),
+        complete: false,
+        unreadable: Vec::new(),
+    });
     // `null` when the listing failed: unknown, not absent.
     let service_key_configured = service_key_safes(wallet)
         .ok()
@@ -2067,7 +2071,7 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
         "approval_required" => "An approval ceremony is open. Complete it, then write `confirm.json` again to collect the signature.\n",
         "signed" => "Write `execute.json` with an executor wallet to stage the outer transaction. The executor pays gas and is a separate approval from the owner signature.\n",
         "proposed" => "The transaction is published to the Transaction Service. Collect the remaining confirmations, then write `execute.json`.\n",
-        "execution_staged" => "The outer transaction is staged in Bloom's EVM outbox. Approve it there, then read `status.json` to reconcile the receipt.\n",
+        "execution_staged" => "The outer transaction is staged in Bloom's EVM outbox. Approve it as the executor wallet, then read `execute.json` until it reaches `executed` or `execution_failed`.\n",
         "executed" => "Done. `status.json` carries both the Safe transaction hash and the outer transaction hash.\n",
         "execution_failed" => "The outer transaction did not execute. If the Safe nonce is unchanged, write `execute.json` again to stage a new attempt; Bloom refuses it once anything else has spent the nonce.\n",
         "nonce_conflict" => "Another transaction consumed this Safe nonce. This draft can no longer execute; draft a replacement at the current nonce.\n",
