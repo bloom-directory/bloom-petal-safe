@@ -1,0 +1,25 @@
+name: Release Petal
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # The same reviewed petal commit that route/Cargo.toml and scripts/build.sh
+    # pin, so a release is byte-identical to a local build.
+    uses: bloom-directory/petal/.github/workflows/release-petal.yml@9ad7a5c635f092bbcdf8f00a06b23676806ff70c
+    with:
+      petal-name: safe
+      petal-tooling-ref: "9ad7a5c635f092bbcdf8f00a06b23676806ff70c"
+      build-command: scripts/build.sh
+      package-root: .
+      expected-route-count: 17
