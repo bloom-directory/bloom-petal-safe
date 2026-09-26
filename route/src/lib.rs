@@ -907,17 +907,23 @@ pub fn read_binding(wallet: &str, safe_id: &str) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (queue, history) = match queue_and_history(wallet, safe_id) {
+    let projection = match queue_and_history(wallet, safe_id) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    // `null` when the listing failed: unknown, not absent.
+    let service_key_configured = service_key_safes(wallet)
+        .ok()
+        .map(|safes| safes.iter().any(|v| v == safe_id));
     petal::read_json_value(&json!({
         "binding": binding,
         "current": current,
         "configuration_changed": configuration(&binding.safe) != configuration(&current),
-        "service_key_configured": service_key_safes(wallet).is_ok_and(|safes| safes.iter().any(|v| v == safe_id)),
-        "queue": queue,
-        "history": history,
+        "service_key_configured": service_key_configured,
+        "queue": projection.queue,
+        "history": projection.history,
+        "history_complete": projection.complete,
+        "unreadable_transactions": projection.unreadable,
     }))
 }
 
@@ -1687,7 +1693,10 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if state.outbox_id.is_some() {
+    // A staged attempt is final unless it failed: a reverted or failed outer
+    // transaction did not execute the Safe transaction, and the nonce check
+    // below refuses a new attempt once anything else has spent the nonce.
+    if state.outbox_id.is_some() && state.phase != "execution_failed" {
         return DispatchResponse::Write;
     }
     let binding: Binding = match load(&binding_key(wallet, &state.safe_id), "Safe binding") {
@@ -1785,6 +1794,7 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     state.executor_wallet = Some(request.executor_wallet);
     state.phase = "execution_staged".into();
     state.execution_status = Some("staged".into());
+    state.execution_tx_hash = None;
     match save(&tx_key(wallet, id), &state) {
         Ok(()) => DispatchResponse::Write,
         Err(e) => e,
@@ -1871,14 +1881,19 @@ struct QueueEntry {
 /// Both lists are ordered by Safe nonce and then transaction id so a caller
 /// can see which drafts collide on the same nonce. Only one of them can ever
 /// execute; the Safe contract, not this projection, decides which.
-fn queue_and_history(
-    wallet: &str,
-    safe_id: &str,
-) -> Result<(Vec<QueueEntry>, Vec<QueueEntry>), DispatchResponse> {
+///
+/// It is not complete when the wallet holds more transactions than a listing
+/// returns, or when a stored record cannot be read; `unreadable` names the
+/// records that were skipped so neither case passes for full history.
+fn queue_and_history(wallet: &str, safe_id: &str) -> Result<QueueProjection, DispatchResponse> {
     let mut pending = Vec::new();
     let mut history = Vec::new();
-    for id in transaction_ids(wallet)? {
+    let mut unreadable = Vec::new();
+    let ids = transaction_ids(wallet)?;
+    let truncated = ids.len() >= MAX_LISTED;
+    for id in ids {
         let Ok(state) = load::<TransactionState>(&tx_key(wallet, &id), "Safe transaction") else {
+            unreadable.push(id);
             continue;
         };
         if state.safe_id != safe_id {
@@ -1904,7 +1919,20 @@ fn queue_and_history(
     };
     pending.sort_by_key(order);
     history.sort_by_key(order);
-    Ok((pending, history))
+    Ok(QueueProjection {
+        complete: !truncated && unreadable.is_empty(),
+        queue: pending,
+        history,
+        unreadable,
+    })
+}
+
+/// The queue and history for one Safe, and whether they are the whole of it.
+struct QueueProjection {
+    queue: Vec<QueueEntry>,
+    history: Vec<QueueEntry>,
+    complete: bool,
+    unreadable: Vec<String>,
 }
 
 /// A Markdown reading aid for one drafted Safe transaction.
@@ -2010,20 +2038,27 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
             .iter()
             .filter(|owner| *owner != &binding.owner || state.owner_signature.is_none())
             .collect();
-        out.push_str(&format!(
-            "- Still needs {missing} more signature(s), from any {missing} of these owners:\n"
-        ));
-        for owner in eligible {
-            let mine = if owner == &binding.owner {
+        let every = missing >= eligible.len();
+        out.push_str(&if every {
+            format!("- Still needs {missing} more signature(s), from each of these owners:\n")
+        } else {
+            format!(
+                "- Still needs {missing} more signature(s), from any {missing} of these owners:\n"
+            )
+        });
+        for owner in &eligible {
+            let mine = if *owner == &binding.owner {
                 " (this Bloom wallet)"
             } else {
                 ""
             };
             out.push_str(&format!("  - `{owner}`{mine}\n"));
         }
-        out.push_str(
-            "  No single owner is required: any subset that reaches the threshold executes.\n",
-        );
+        out.push_str(if every {
+            "  Every listed owner must sign: the threshold equals the owners still missing.\n"
+        } else {
+            "  No single owner is required: any subset that reaches the threshold executes.\n"
+        });
     }
 
     out.push_str("\n## Next step\n\n");
@@ -2034,7 +2069,7 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
         "proposed" => "The transaction is published to the Transaction Service. Collect the remaining confirmations, then write `execute.json`.\n",
         "execution_staged" => "The outer transaction is staged in Bloom's EVM outbox. Approve it there, then read `status.json` to reconcile the receipt.\n",
         "executed" => "Done. `status.json` carries both the Safe transaction hash and the outer transaction hash.\n",
-        "execution_failed" => "The outer transaction did not succeed. Check `status.json`; if the Safe nonce is unchanged, execution can be retried.\n",
+        "execution_failed" => "The outer transaction did not execute. If the Safe nonce is unchanged, write `execute.json` again to stage a new attempt; Bloom refuses it once anything else has spent the nonce.\n",
         "nonce_conflict" => "Another transaction consumed this Safe nonce. This draft can no longer execute; draft a replacement at the current nonce.\n",
         _ => "Read `status.json` for the current phase.\n",
     });
@@ -2221,6 +2256,15 @@ mod tests {
         assert!(plan.contains("Still needs 1 more signature(s)"));
         // Bloom's own owner has already signed, so it is not offered again.
         assert!(!plan.contains(&format!("`{}` (this Bloom wallet)", binding.owner)));
+        assert!(plan.contains("No single owner is required"));
+
+        // N of N: every owner is required, and the plan must not say otherwise.
+        let mut all = state("draft", TransactionRequest::Rejection);
+        all.snapshot.threshold = all.snapshot.owners.len().to_string();
+        let plan = plan_markdown(&binding, &all);
+        assert!(plan.contains("from each of these owners"));
+        assert!(plan.contains("Every listed owner must sign"));
+        assert!(!plan.contains("No single owner is required"));
     }
 
     #[test]
