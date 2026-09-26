@@ -564,15 +564,92 @@ fn wallet_address(wallet: &str) -> Result<String, DispatchResponse> {
 }
 
 fn binding_key(wallet: &str, safe_id: &str) -> String {
-    format!("state/safes/{wallet}/{safe_id}.json")
+    format!("{BINDING_PREFIX}{wallet}/{safe_id}.json")
 }
 fn tx_key(wallet: &str, id: &str) -> String {
-    format!("state/transactions/{wallet}/{id}.json")
+    format!("{TRANSACTION_PREFIX}{wallet}/{id}.json")
 }
 fn api_key_key(wallet: &str, safe_id: &str) -> String {
     // The SDK reads `creds/` keys from the secret namespace; any other prefix
     // reads state, so a key stored as a secret could never be read back.
-    format!("creds/services/{wallet}/{safe_id}.txt")
+    format!("{SERVICE_KEY_PREFIX}{wallet}/{safe_id}.txt")
+}
+
+const BINDING_PREFIX: &str = "state/safes/";
+const TRANSACTION_PREFIX: &str = "state/transactions/";
+const SERVICE_KEY_PREFIX: &str = "creds/services/";
+/// Listings project stored key names only, so this bounds the key bytes the
+/// host returns rather than any record body.
+const MAX_LIST_BYTES: usize = 256 * 1024;
+const MAX_LISTED: usize = 1024;
+
+/// The segment of a stored key at `index`, counting from just after `prefix`.
+///
+/// Every key this Petal writes is `<prefix><wallet>/<leaf>`, so index 0 is the
+/// wallet and index 1 the record. Names alone are projected; no value is read,
+/// which is what keeps the service-key listing free of the key itself.
+fn key_segment<'a>(key: &'a str, prefix: &str, index: usize) -> Option<&'a str> {
+    key.strip_prefix(prefix)?.split('/').nth(index)
+}
+
+/// `is_safe_segment` allows a `/`, which is a valid character inside a store
+/// key but never inside a directory entry name, so a listing rejects it too.
+fn listed(names: BTreeSet<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|name| petal::is_safe_segment(name) && !name.contains('/'))
+        .take(MAX_LISTED)
+        .collect()
+}
+
+/// Wallets holding at least one record under `prefix`.
+pub fn list_wallets(prefix: &str) -> Result<Vec<String>, DispatchResponse> {
+    let keys = petal::sdk::store_list(prefix, MAX_LIST_BYTES).map_err(sdk_error)?;
+    Ok(listed(
+        keys.iter()
+            .filter_map(|key| key_segment(key, prefix, 0))
+            .map(str::to_string)
+            .collect(),
+    ))
+}
+
+/// Record names one wallet holds under `prefix`, with `suffix` trimmed.
+pub fn list_records(
+    prefix: &str,
+    wallet: &str,
+    suffix: &str,
+) -> Result<Vec<String>, DispatchResponse> {
+    safe_segment(wallet, "wallet")?;
+    let prefix = format!("{prefix}{wallet}/");
+    let keys = petal::sdk::store_list(&prefix, MAX_LIST_BYTES).map_err(sdk_error)?;
+    Ok(listed(
+        keys.iter()
+            .filter_map(|key| key_segment(key, &prefix, 0))
+            .filter_map(|name| name.strip_suffix(suffix))
+            .map(str::to_string)
+            .collect(),
+    ))
+}
+
+pub fn bound_wallets() -> Result<Vec<String>, DispatchResponse> {
+    list_wallets(BINDING_PREFIX)
+}
+pub fn bound_safes(wallet: &str) -> Result<Vec<String>, DispatchResponse> {
+    list_records(BINDING_PREFIX, wallet, ".json")
+}
+pub fn transaction_wallets() -> Result<Vec<String>, DispatchResponse> {
+    list_wallets(TRANSACTION_PREFIX)
+}
+pub fn transaction_ids(wallet: &str) -> Result<Vec<String>, DispatchResponse> {
+    list_records(TRANSACTION_PREFIX, wallet, ".json")
+}
+pub fn service_key_wallets() -> Result<Vec<String>, DispatchResponse> {
+    list_wallets(SERVICE_KEY_PREFIX)
+}
+/// Safes this wallet has configured a service key for. The key itself is never
+/// read; only the name of the record it is stored under.
+pub fn service_key_safes(wallet: &str) -> Result<Vec<String>, DispatchResponse> {
+    list_records(SERVICE_KEY_PREFIX, wallet, ".txt")
 }
 
 fn load<T: for<'de> Deserialize<'de>>(key: &str, label: &str) -> Result<T, DispatchResponse> {
@@ -830,9 +907,28 @@ pub fn read_binding(wallet: &str, safe_id: &str) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    petal::read_json_value(
-        &json!({"binding":binding,"current":current,"configuration_changed": configuration(&binding.safe) != configuration(&current)}),
-    )
+    // The binding stays readable when the transaction listing is not: the
+    // projection then reports itself incomplete instead of failing the read.
+    let projection = queue_and_history(wallet, safe_id).unwrap_or(QueueProjection {
+        queue: Vec::new(),
+        history: Vec::new(),
+        complete: false,
+        unreadable: Vec::new(),
+    });
+    // `null` when the listing failed: unknown, not absent.
+    let service_key_configured = service_key_safes(wallet)
+        .ok()
+        .map(|safes| safes.iter().any(|v| v == safe_id));
+    petal::read_json_value(&json!({
+        "binding": binding,
+        "current": current,
+        "configuration_changed": configuration(&binding.safe) != configuration(&current),
+        "service_key_configured": service_key_configured,
+        "queue": projection.queue,
+        "history": projection.history,
+        "history_complete": projection.complete,
+        "unreadable_transactions": projection.unreadable,
+    }))
 }
 
 fn configuration(
@@ -1601,7 +1697,10 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if state.outbox_id.is_some() {
+    // A staged attempt is final unless it failed: a reverted or failed outer
+    // transaction did not execute the Safe transaction, and the nonce check
+    // below refuses a new attempt once anything else has spent the nonce.
+    if state.outbox_id.is_some() && state.phase != "execution_failed" {
         return DispatchResponse::Write;
     }
     let binding: Binding = match load(&binding_key(wallet, &state.safe_id), "Safe binding") {
@@ -1699,6 +1798,7 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     state.executor_wallet = Some(request.executor_wallet);
     state.phase = "execution_staged".into();
     state.execution_status = Some("staged".into());
+    state.execution_tx_hash = None;
     match save(&tx_key(wallet, id), &state) {
         Ok(()) => DispatchResponse::Write,
         Err(e) => e,
@@ -1747,9 +1847,8 @@ pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
     // While our own execution is in flight the nonce advancing is the expected
     // outcome, not a conflict; only a failed or never-staged execution makes
     // an advanced nonce mean someone else spent it.
-    let execution_in_flight = state.outbox_id.is_some()
-        && state.phase != "executed"
-        && state.phase != "execution_failed";
+    let execution_in_flight =
+        state.outbox_id.is_some() && state.phase != "executed" && state.phase != "execution_failed";
     let nonce_conflict = current_nonce.as_deref().is_some_and(|current| {
         uint(current, "current nonce").ok() > uint(&state.safe_tx.nonce, "transaction nonce").ok()
             && state.phase != "executed"
@@ -1767,6 +1866,238 @@ pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
         "current_safe_nonce":current_nonce,"nonce_conflict":nonce_conflict
     });
     petal::read_json_value(&view)
+}
+
+/// One line of a per-Safe queue or history projection.
+#[derive(Clone, Debug, Serialize)]
+struct QueueEntry {
+    id: String,
+    nonce: String,
+    phase: String,
+    safe_tx_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_tx_hash: Option<String>,
+}
+
+/// Transactions this wallet holds for one bound Safe, split into those still
+/// competing for a nonce and those that reached a terminal outcome.
+///
+/// Both lists are ordered by Safe nonce and then transaction id so a caller
+/// can see which drafts collide on the same nonce. Only one of them can ever
+/// execute; the Safe contract, not this projection, decides which.
+///
+/// It is not complete when the wallet holds more transactions than a listing
+/// returns, or when a stored record cannot be read; `unreadable` names the
+/// records that were skipped so neither case passes for full history.
+fn queue_and_history(wallet: &str, safe_id: &str) -> Result<QueueProjection, DispatchResponse> {
+    let mut pending = Vec::new();
+    let mut history = Vec::new();
+    let mut unreadable = Vec::new();
+    let ids = transaction_ids(wallet)?;
+    let truncated = ids.len() >= MAX_LISTED;
+    for id in ids {
+        let Ok(state) = load::<TransactionState>(&tx_key(wallet, &id), "Safe transaction") else {
+            unreadable.push(id);
+            continue;
+        };
+        if state.safe_id != safe_id {
+            continue;
+        }
+        let entry = QueueEntry {
+            id,
+            nonce: state.safe_tx.nonce.clone(),
+            phase: state.phase.clone(),
+            safe_tx_hash: state.safe_tx_hash.clone(),
+            execution_tx_hash: state.execution_tx_hash.clone(),
+        };
+        match state.phase.as_str() {
+            "executed" | "execution_failed" | "nonce_conflict" => history.push(entry),
+            _ => pending.push(entry),
+        }
+    }
+    let order = |entry: &QueueEntry| {
+        (
+            uint(&entry.nonce, "nonce").ok().unwrap_or(U256::MAX),
+            entry.id.clone(),
+        )
+    };
+    pending.sort_by_key(order);
+    history.sort_by_key(order);
+    Ok(QueueProjection {
+        complete: !truncated && unreadable.is_empty(),
+        queue: pending,
+        history,
+        unreadable,
+    })
+}
+
+/// The queue and history for one Safe, and whether they are the whole of it.
+struct QueueProjection {
+    queue: Vec<QueueEntry>,
+    history: Vec<QueueEntry>,
+    complete: bool,
+    unreadable: Vec<String>,
+}
+
+/// A Markdown reading aid for one drafted Safe transaction.
+///
+/// Deterministic and store-only: it never reads the chain, so it renders the
+/// configuration recorded when the transaction was drafted rather than a live
+/// observation, and says so. `status.json` is the live view. Reading it starts
+/// no ceremony and signs nothing; Broker's own review, not this file, is what
+/// authorizes a signature.
+fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
+    let safe = &state.snapshot;
+    let mut out = String::new();
+    out.push_str(&format!("# Safe transaction {}\n\n", state.id));
+    out.push_str(&format!(
+        "Drafted by Bloom wallet `{}` for Safe `{}` (`{}`) on chain `{}` (id {}).\n\n",
+        state.wallet, state.safe_id, safe.safe_address, binding.chain, safe.chain_id
+    ));
+
+    out.push_str("## Action\n\n");
+    out.push_str(&match &state.request {
+        TransactionRequest::NativeTransfer { to, value } => {
+            format!("Send {value} wei of the chain's native asset to `{to}`.\n")
+        }
+        TransactionRequest::Erc20Transfer { token, to, amount } => format!(
+            "Call `transfer` on token `{token}`, moving {amount} of its smallest unit to `{to}`.\nThe Petal does not read token metadata, so this is the raw on-chain amount, not a decimal-adjusted one.\n"
+        ),
+        TransactionRequest::Call(call) => format!(
+            "Call `{}` with {} wei attached and {} bytes of calldata.\n",
+            call.to,
+            call.value,
+            call.data.len().saturating_sub(2) / 2
+        ),
+        TransactionRequest::Batch { calls } => format!(
+            "Run {} calls in one `MultiSendCallOnly` delegatecall:\n\n{}",
+            calls.len(),
+            calls
+                .iter()
+                .map(|call| format!(
+                    "- `{}`, {} wei, {} bytes of calldata\n",
+                    call.to,
+                    call.value,
+                    call.data.len().saturating_sub(2) / 2
+                ))
+                .collect::<String>()
+        ),
+        TransactionRequest::TransactionBuilder { builder } => format!(
+            "Run a Safe Transaction Builder file of {} transactions for chain id {}.\n",
+            builder.transactions.len(),
+            builder.chain_id
+        ),
+        TransactionRequest::Create { value, .. } => {
+            format!("Deploy a contract through `CreateCall` with {value} wei of endowment.\n")
+        }
+        TransactionRequest::Create2 { value, salt, .. } => format!(
+            "Deploy a contract through `CreateCall` at a CREATE2 address with salt `{salt}` and {value} wei of endowment.\n"
+        ),
+        TransactionRequest::Rejection => {
+            "Consume this Safe nonce without doing anything, so that no other transaction at this nonce can execute.\n".into()
+        }
+    });
+
+    out.push_str("\n## Exact transaction\n\n");
+    for (field, value) in [
+        ("Safe transaction hash", state.safe_tx_hash.as_str()),
+        ("Safe nonce", state.safe_tx.nonce.as_str()),
+        ("To", state.safe_tx.to.as_str()),
+        ("Value (wei)", state.safe_tx.value.as_str()),
+    ] {
+        out.push_str(&format!("- {field}: `{value}`\n"));
+    }
+    out.push_str(&format!(
+        "- Operation: {}\n",
+        match state.safe_tx.operation {
+            0 => "0 (call)",
+            _ => "1 (delegatecall to a verified Safe library)",
+        }
+    ));
+    out.push_str(&format!(
+        "- Calldata: {} bytes\n",
+        state.safe_tx.data.len().saturating_sub(2) / 2
+    ));
+    out.push_str(
+        "- Gas reimbursement: disabled (`safeTxGas`, `baseGas`, `gasPrice` zero, no gas token, no refund receiver)\n",
+    );
+    if let Some(hash) = &state.library_code_hash {
+        out.push_str(&format!("- Verified library runtime code hash: `{hash}`\n"));
+    }
+
+    out.push_str("\n## Authorization\n\n");
+    let threshold = safe.threshold.parse::<usize>().unwrap_or(usize::MAX);
+    let held = usize::from(state.owner_signature.is_some());
+    out.push_str(&format!(
+        "- Threshold: {} of {} owners\n- Signatures Bloom holds: {held}\n",
+        safe.threshold,
+        safe.owners.len()
+    ));
+    if held >= threshold {
+        out.push_str("- Quorum is met by the signatures Bloom holds.\n");
+    } else {
+        let missing = threshold.saturating_sub(held);
+        let eligible: Vec<&String> = safe
+            .owners
+            .iter()
+            .filter(|owner| *owner != &binding.owner || state.owner_signature.is_none())
+            .collect();
+        let every = missing >= eligible.len();
+        out.push_str(&if every {
+            format!("- Still needs {missing} more signature(s), from each of these owners:\n")
+        } else {
+            format!(
+                "- Still needs {missing} more signature(s), from any {missing} of these owners:\n"
+            )
+        });
+        for owner in &eligible {
+            let mine = if *owner == &binding.owner {
+                " (this Bloom wallet)"
+            } else {
+                ""
+            };
+            out.push_str(&format!("  - `{owner}`{mine}\n"));
+        }
+        out.push_str(if every {
+            "  Every listed owner must sign: the threshold equals the owners still missing.\n"
+        } else {
+            "  No single owner is required: any subset that reaches the threshold executes.\n"
+        });
+    }
+
+    out.push_str("\n## Next step\n\n");
+    out.push_str(match state.phase.as_str() {
+        "draft" => "Write `confirm.json` to ask Bloom for this wallet's owner signature. That opens an approval ceremony showing Broker's own reconstruction of the transaction.\n",
+        "approval_required" => "An approval ceremony is open. Complete it, then write `confirm.json` again to collect the signature.\n",
+        "signed" => "Write `execute.json` with an executor wallet to stage the outer transaction. The executor pays gas and is a separate approval from the owner signature.\n",
+        "proposed" => "The transaction is published to the Transaction Service. Collect the remaining confirmations, then write `execute.json`.\n",
+        "execution_staged" => "The outer transaction is staged in Bloom's EVM outbox. Approve it as the executor wallet, then read `execute.json` until it reaches `executed` or `execution_failed`.\n",
+        "executed" => "Done. `status.json` carries both the Safe transaction hash and the outer transaction hash.\n",
+        "execution_failed" => "The outer transaction did not execute. If the Safe nonce is unchanged, write `execute.json` again to stage a new attempt; Bloom refuses it once anything else has spent the nonce.\n",
+        "nonce_conflict" => "Another transaction consumed this Safe nonce. This draft can no longer execute; draft a replacement at the current nonce.\n",
+        _ => "Read `status.json` for the current phase.\n",
+    });
+
+    out.push_str(
+        "\n## What this file is not\n\nEvery value above is what the Petal recorded when the transaction was drafted, including the owner set and threshold. Broker rebuilds the signing preimage itself and shows its own reconstruction during the approval ceremony; that display, not this file, is the authority for what gets signed.\n",
+    );
+    out
+}
+
+pub fn read_plan(wallet: &str, id: &str) -> DispatchResponse {
+    if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
+    {
+        return e;
+    }
+    let state: TransactionState = match load(&tx_key(wallet, id), "Safe transaction") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let binding: Binding = match load(&binding_key(wallet, &state.safe_id), "Safe binding") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    DispatchResponse::Read(plan_markdown(&binding, &state).into_bytes())
 }
 
 pub fn set_service_key(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
@@ -1808,10 +2139,180 @@ mod tests {
         }
     }
 
+    fn snapshot() -> SafeSnapshot {
+        SafeSnapshot {
+            chain_id: "1".into(),
+            safe_address: "0x1000000000000000000000000000000000000000".into(),
+            safe_version: "1.4.1".into(),
+            singleton: "0x41675c099f32341bf84bfc5382af534df5c7461a".into(),
+            singleton_code_hash:
+                "0x1fe2df852ba3299d6534ef416eefa406e56ced995bca886ab7a553e6d0c5e1c4".into(),
+            owners: vec![
+                "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".into(),
+                "0x70997970c51812dc3a010c7d01b50e0d17dc79c8".into(),
+                "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc".into(),
+            ],
+            threshold: "2".into(),
+            nonce: "4".into(),
+            guard: ZERO.into(),
+            modules: vec![],
+            fallback_handler: ZERO.into(),
+        }
+    }
+
+    fn binding() -> Binding {
+        let safe = snapshot();
+        Binding {
+            schema: "bloom.safe.binding.v1".into(),
+            wallet: "owner".into(),
+            owner: safe.owners[0].clone(),
+            chain: "ethereum".into(),
+            safe,
+            transaction_service: None,
+        }
+    }
+
+    fn state(phase: &str, request: TransactionRequest) -> TransactionState {
+        TransactionState {
+            schema: "bloom.safe.transaction.v1".into(),
+            wallet: "owner".into(),
+            safe_id: "treasury".into(),
+            id: "payment".into(),
+            request,
+            snapshot: snapshot(),
+            safe_tx: tx(),
+            safe_tx_hash: "0xa6119a03d6d492a10575b05da6c5eb47b9aae120c346935ef329c9a9a559a509"
+                .into(),
+            phase: phase.into(),
+            owner_signature: None,
+            approval_action_id: None,
+            service_status: None,
+            outbox_id: None,
+            execution_tx_hash: None,
+            execution_status: None,
+            executor_wallet: None,
+            library_code_hash: None,
+        }
+    }
+
     #[test]
     fn service_key_is_stored_where_the_sdk_reads_secrets() {
         // `store_get` only consults the secret namespace for `creds/` keys.
         assert!(api_key_key("owner", "treasury").starts_with("creds/"));
+    }
+
+    #[test]
+    fn listings_project_the_wallet_and_record_of_a_stored_key() {
+        let key = binding_key("owner", "treasury");
+        assert_eq!(key_segment(&key, BINDING_PREFIX, 0), Some("owner"));
+        assert_eq!(key_segment(&key, BINDING_PREFIX, 1), Some("treasury.json"));
+        // A key from another subtree must not be projected into this listing.
+        assert_eq!(
+            key_segment(&tx_key("owner", "payment"), BINDING_PREFIX, 0),
+            None
+        );
+        // A deeper key than this Petal writes yields no third segment.
+        assert_eq!(key_segment(&key, BINDING_PREFIX, 2), None);
+    }
+
+    #[test]
+    fn listings_are_deduplicated_sorted_and_reject_unsafe_names() {
+        let names = BTreeSet::from([
+            "beta".to_string(),
+            "alpha".to_string(),
+            "beta".to_string(),
+            "../escape".to_string(),
+            "".to_string(),
+        ]);
+        assert_eq!(listed(names), vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// A plan is a reading aid. It must never imply that Bloom alone can
+    /// execute a transaction whose threshold it cannot meet, and it must not
+    /// name one particular owner as the missing one when any two of three
+    /// qualify.
+    #[test]
+    fn a_plan_states_the_quorum_honestly() {
+        let binding = binding();
+        let plan = plan_markdown(
+            &binding,
+            &state(
+                "draft",
+                TransactionRequest::NativeTransfer {
+                    to: "0x4000000000000000000000000000000000000000".into(),
+                    value: "7".into(),
+                },
+            ),
+        );
+        assert!(plan.contains("Threshold: 2 of 3 owners"));
+        assert!(plan.contains("Signatures Bloom holds: 0"));
+        assert!(plan.contains("Still needs 2 more signature(s)"));
+        for owner in &binding.safe.owners {
+            assert!(plan.contains(owner.as_str()), "plan omits owner {owner}");
+        }
+        assert!(plan.contains("No single owner is required"));
+        assert!(!plan.contains("Quorum is met"));
+
+        let mut signed = state("signed", TransactionRequest::Rejection);
+        signed.owner_signature = Some("0x00".into());
+        let plan = plan_markdown(&binding, &signed);
+        assert!(plan.contains("Signatures Bloom holds: 1"));
+        assert!(plan.contains("Still needs 1 more signature(s)"));
+        // Bloom's own owner has already signed, so it is not offered again.
+        assert!(!plan.contains(&format!("`{}` (this Bloom wallet)", binding.owner)));
+        assert!(plan.contains("No single owner is required"));
+
+        // N of N: every owner is required, and the plan must not say otherwise.
+        let mut all = state("draft", TransactionRequest::Rejection);
+        all.snapshot.threshold = all.snapshot.owners.len().to_string();
+        let plan = plan_markdown(&binding, &all);
+        assert!(plan.contains("from each of these owners"));
+        assert!(plan.contains("Every listed owner must sign"));
+        assert!(!plan.contains("No single owner is required"));
+    }
+
+    #[test]
+    fn a_plan_never_claims_verified_state_or_a_decimal_amount() {
+        let plan = plan_markdown(
+            &binding(),
+            &state(
+                "draft",
+                TransactionRequest::Erc20Transfer {
+                    token: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+                    to: "0x4000000000000000000000000000000000000000".into(),
+                    amount: "1000000".into(),
+                },
+            ),
+        );
+        assert!(plan.contains("raw on-chain amount, not a decimal-adjusted one"));
+        assert!(plan.contains("what the Petal recorded when the transaction was drafted"));
+        assert!(plan.contains("Broker rebuilds the signing preimage itself"));
+        // Gas reimbursement being disabled is what keeps an approval bounded.
+        assert!(plan.contains("Gas reimbursement: disabled"));
+    }
+
+    #[test]
+    fn a_plan_names_the_next_step_for_every_phase_it_can_reach() {
+        let binding = binding();
+        for phase in [
+            "draft",
+            "approval_required",
+            "signed",
+            "proposed",
+            "execution_staged",
+            "executed",
+            "execution_failed",
+            "nonce_conflict",
+        ] {
+            let plan = plan_markdown(&binding, &state(phase, TransactionRequest::Rejection));
+            let next = plan.split("## Next step").nth(1).unwrap_or_default();
+            assert!(
+                !next
+                    .trim_start()
+                    .starts_with("Read `status.json` for the current phase."),
+                "phase {phase} falls through to the generic next step"
+            );
+        }
     }
 
     #[test]
