@@ -4,7 +4,7 @@ petal::route_file!(
         "petal":"safe",
         "status":"ok",
         "safe_versions":["1.3.0","1.4.1","1.5.0"],
-        "operations":["create_safe","bind","inspect","call","native_transfer","erc20_transfer","call_only_batch","transaction_builder","create","create2","reject","confirm","propose","execute","reconcile"],
-        "security":{"refunds":"disabled","delegatecall":["MultiSendCallOnly","CreateCall"],"safe_administration":"rejected","future_nonces":"up to 64 past the current nonce","signatures":["ecdsa","eth_sign","approved_hash"]}
+        "operations":["create_safe","add_owner","remove_owner","swap_owner","change_threshold","bind","inspect","call","native_transfer","erc20_transfer","call_only_batch","transaction_builder","create","create2","reject","confirm","propose","execute","reconcile"],
+        "security":{"refunds":"disabled","delegatecall":["MultiSendCallOnly","CreateCall"],"safe_administration":"owners and threshold only","future_nonces":"up to 64 past the current nonce","signatures":["ecdsa","eth_sign","approved_hash"]}
     }))
 );

@@ -2,7 +2,7 @@
 
 Create and operate Safe smart accounts with Bloom-backed owner signing and EVM execution. Owner and executor private keys stay in Bloom; no deployment or signing key is placed in an environment variable.
 
-The Petal supports Safe 1.3.0, 1.4.1, and 1.5.0, native transfers, arbitrary calls, ERC-20 transfers, call-only batches, Safe Transaction Builder imports, CREATE, CREATE2, rejection transactions, Safe Transaction Service proposal/confirmation, offline signature collection, on-chain hash approvals, queued nonces, and outbox execution.
+The Petal supports Safe 1.3.0, 1.4.1, and 1.5.0, native transfers, arbitrary calls, ERC-20 transfers, call-only batches, Safe Transaction Builder imports, CREATE, CREATE2, rejection transactions, Safe Transaction Service proposal/confirmation, offline signature collection, on-chain hash approvals, queued nonces, owner and threshold changes, and outbox execution.
 
 ## Install and policy
 
@@ -98,9 +98,15 @@ Write `{"safe_id":"treasury","transaction":...}` to `petals/safe/transactions/<w
 {"kind":"create","value":"0","initcode":"0x..."}
 {"kind":"create2","value":"0","initcode":"0x...","salt":"0x<32 bytes>"}
 {"kind":"rejection"}
+{"kind":"add_owner","owner":"0x...","threshold":"2"}
+{"kind":"remove_owner","owner":"0x...","threshold":"1"}
+{"kind":"swap_owner","old_owner":"0x...","new_owner":"0x..."}
+{"kind":"change_threshold","threshold":"2"}
 ```
 
-Batches and multi-transaction Builder files use only the pinned canonical `MultiSendCallOnly`. Builder entries may contain raw `data` or a standard `contractMethod` plus `contractInputsValues`; an entry carrying both is refused unless they encode the same call. Bloom ABI-encodes scalar, array, and tuple inputs and rejects missing, extra, or invalid values. Deployments use only the pinned canonical `CreateCall`. The Petal reads and hashes the runtime code before drafting. Arbitrary delegatecalls and Safe self-calls are rejected. Refund fields are fixed to zero.
+Batches and multi-transaction Builder files use only the pinned canonical `MultiSendCallOnly`. Builder entries may contain raw `data` or a standard `contractMethod` plus `contractInputsValues`; an entry carrying both is refused unless they encode the same call. Bloom ABI-encodes scalar, array, and tuple inputs and rejects missing, extra, or invalid values. Deployments use only the pinned canonical `CreateCall`. The Petal reads and hashes the runtime code before drafting. Arbitrary delegatecalls are rejected, and so is every Safe self-call other than a rejection and the four owner and threshold changes.
+
+An owner or threshold change is checked against the Safe's current owners, and Broker shows it decoded, with a warning when it removes this Bloom wallet. Once it executes, the Safe no longer matches its binding: bind it again, and draft again anything queued against the old owners. Refund fields are fixed to zero.
 
 ## Read the plan
 
@@ -164,7 +170,7 @@ Bloom keeps a Petal's stored state per package. A new version of this Petal star
 - A transaction can be signed for the current Safe nonce or up to 64 past it. A signature for a queued nonce stays valid until that nonce is spent.
 - Safe configuration drift blocks signing and execution until the Safe is rebound.
 - All Safe gas reimbursement fields are zero.
-- Safe self-administration, arbitrary delegatecalls, modules as authorization, and EIP-7702 accounts are rejected.
+- Safe self-administration other than owner and threshold changes (modules, guards, fallback handler), arbitrary delegatecalls, modules as authorization, and EIP-7702 accounts are rejected.
 - A configured guard or module is surfaced in every review; guards can still reject execution, and modules may execute transactions outside this Petal.
 
 ## Development

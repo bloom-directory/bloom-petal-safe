@@ -37,6 +37,10 @@ sol! {
     function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address payable refundReceiver, bytes signatures) returns (bool success);
     function transfer(address to, uint256 value) returns (bool);
     function approvedHashes(address owner, bytes32 hash) external view returns (uint256);
+    function addOwnerWithThreshold(address owner, uint256 threshold);
+    function removeOwner(address prevOwner, address owner, uint256 threshold);
+    function swapOwner(address prevOwner, address oldOwner, address newOwner);
+    function changeThreshold(uint256 threshold);
     function setup(address[] owners, uint256 threshold, address to, bytes data, address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver);
     function createProxyWithNonce(address singleton, bytes initializer, uint256 saltNonce) returns (address proxy);
 }
@@ -163,6 +167,21 @@ pub enum TransactionRequest {
         salt: String,
     },
     Rejection,
+    AddOwner {
+        owner: String,
+        threshold: String,
+    },
+    RemoveOwner {
+        owner: String,
+        threshold: String,
+    },
+    SwapOwner {
+        old_owner: String,
+        new_owner: String,
+    },
+    ChangeThreshold {
+        threshold: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1116,6 +1135,106 @@ fn verified_library(
     ))
 }
 
+/// Calldata for one of the four Safe self-calls that change who may sign and
+/// how many must, checked against the owners the Safe has now. Nothing else
+/// about a Safe can be changed from here: modules, guards and the fallback
+/// handler hand the Safe to other code.
+fn owner_change(
+    request: &TransactionRequest,
+    safe: Address,
+    current: &SafeSnapshot,
+) -> Result<Option<Vec<u8>>, DispatchResponse> {
+    let owners = current
+        .owners
+        .iter()
+        .map(|v| address(v, "owner"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sentinel = address(SENTINEL, "sentinel")?;
+    let position = |owner: Address| {
+        owners
+            .iter()
+            .position(|v| *v == owner)
+            .ok_or_else(|| denied(format!("{owner:#x} is not an owner of this Safe")))
+    };
+    // Safe keeps owners in a linked list and needs the entry before the one
+    // being removed; `getOwners` returns them in list order.
+    let previous = |index: usize| {
+        if index == 0 {
+            sentinel
+        } else {
+            owners[index - 1]
+        }
+    };
+    let new_owner = |value: &str| {
+        let owner = address(value, "owner")?;
+        if owner == Address::ZERO || owner == sentinel || owner == safe {
+            return Err(invalid("owner is not a usable address"));
+        }
+        if owners.contains(&owner) {
+            return Err(denied(format!(
+                "{owner:#x} is already an owner of this Safe"
+            )));
+        }
+        Ok(owner)
+    };
+    let threshold = |value: &str, owner_count: usize| {
+        let threshold = uint(value, "threshold")?;
+        if threshold == U256::ZERO || threshold > U256::from(owner_count) {
+            return Err(invalid(format!(
+                "threshold must be between 1 and {owner_count}"
+            )));
+        }
+        Ok(threshold)
+    };
+    Ok(Some(match request {
+        TransactionRequest::AddOwner {
+            owner,
+            threshold: value,
+        } => {
+            if owners.len() >= 64 {
+                return Err(denied("this Safe already has 64 owners"));
+            }
+            addOwnerWithThresholdCall {
+                owner: new_owner(owner)?,
+                threshold: threshold(value, owners.len() + 1)?,
+            }
+            .abi_encode()
+        }
+        TransactionRequest::RemoveOwner {
+            owner,
+            threshold: value,
+        } => {
+            let index = position(address(owner, "owner")?)?;
+            if owners.len() == 1 {
+                return Err(denied("a Safe cannot lose its last owner"));
+            }
+            removeOwnerCall {
+                prevOwner: previous(index),
+                owner: owners[index],
+                threshold: threshold(value, owners.len() - 1)?,
+            }
+            .abi_encode()
+        }
+        TransactionRequest::SwapOwner {
+            old_owner,
+            new_owner: replacement,
+        } => {
+            let index = position(address(old_owner, "old_owner")?)?;
+            swapOwnerCall {
+                prevOwner: previous(index),
+                oldOwner: owners[index],
+                newOwner: new_owner(replacement)?,
+            }
+            .abi_encode()
+        }
+        TransactionRequest::ChangeThreshold { threshold: value } => changeThresholdCall {
+            threshold: threshold(value, owners.len())?,
+        }
+        .abi_encode(),
+        _ => return Ok(None),
+    }))
+}
+
 /// How far past the Safe's current nonce a transaction may be drafted.
 const MAX_QUEUE_AHEAD: u64 = 64;
 
@@ -1289,6 +1408,16 @@ fn build_tx(
             )
         }
         TransactionRequest::Rejection => (safe, U256::ZERO, vec![], 0, None),
+        TransactionRequest::AddOwner { .. }
+        | TransactionRequest::RemoveOwner { .. }
+        | TransactionRequest::SwapOwner { .. }
+        | TransactionRequest::ChangeThreshold { .. } => (
+            safe,
+            U256::ZERO,
+            owner_change(request, safe, &current)?.unwrap_or_default(),
+            0,
+            None,
+        ),
     };
     let tx = SafeTx {
         to: format!("{to:#x}"),
@@ -2209,6 +2338,8 @@ struct QueueProjection {
 /// observation, and says so. `status.json` is the live view. Reading it starts
 /// no ceremony and signs nothing; Broker's own review, not this file, is what
 /// authorizes a signature.
+const REBIND: &str = "Once this executes the Safe no longer matches its binding. Bind it again before drafting anything else; transactions already queued against the old owners must be drafted again.\n";
+
 fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
     let safe = &state.snapshot;
     let mut out = String::new();
@@ -2258,6 +2389,21 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
         ),
         TransactionRequest::Rejection => {
             "Consume this Safe nonce without doing anything, so that no other transaction at this nonce can execute.\n".into()
+        }
+        TransactionRequest::AddOwner { owner, threshold } => format!(
+            "Add `{owner}` as an owner of this Safe and set the threshold to {threshold}.\n{REBIND}"
+        ),
+        TransactionRequest::RemoveOwner { owner, threshold } => format!(
+            "Remove `{owner}` from this Safe's owners and set the threshold to {threshold}.\n{REBIND}"
+        ),
+        TransactionRequest::SwapOwner {
+            old_owner,
+            new_owner,
+        } => format!(
+            "Replace owner `{old_owner}` with `{new_owner}`. The threshold does not change.\n{REBIND}"
+        ),
+        TransactionRequest::ChangeThreshold { threshold } => {
+            format!("Set this Safe's threshold to {threshold}.\n{REBIND}")
         }
     });
 
@@ -3245,6 +3391,99 @@ mod tests {
         assert_eq!(setup.paymentToken, Address::ZERO);
         assert_eq!(setup.payment, U256::ZERO);
         assert_eq!(setup.paymentReceiver, Address::ZERO);
+    }
+
+    #[test]
+    fn owner_changes_encode_against_the_current_owner_list() {
+        let current = snapshot();
+        let safe = address(&current.safe_address, "safe").unwrap();
+        let [first, second, third] = [0, 1, 2].map(|i| address(&current.owners[i], "o").unwrap());
+        let sentinel = address(SENTINEL, "sentinel").unwrap();
+        let fresh = "0x9000000000000000000000000000000000000000";
+        let encode = |request: TransactionRequest| owner_change(&request, safe, &current);
+
+        let data = encode(TransactionRequest::RemoveOwner {
+            owner: current.owners[0].clone(),
+            threshold: "2".into(),
+        })
+        .unwrap()
+        .unwrap();
+        let call = removeOwnerCall::abi_decode(&data).unwrap();
+        assert_eq!((call.prevOwner, call.owner), (sentinel, first));
+
+        let data = encode(TransactionRequest::SwapOwner {
+            old_owner: current.owners[2].clone(),
+            new_owner: fresh.into(),
+        })
+        .unwrap()
+        .unwrap();
+        let call = swapOwnerCall::abi_decode(&data).unwrap();
+        assert_eq!((call.prevOwner, call.oldOwner), (second, third));
+        assert_eq!(call.newOwner, address(fresh, "o").unwrap());
+
+        let data = encode(TransactionRequest::AddOwner {
+            owner: fresh.into(),
+            threshold: "4".into(),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            addOwnerWithThresholdCall::abi_decode(&data)
+                .unwrap()
+                .threshold,
+            U256::from(4)
+        );
+
+        for refused in [
+            // Already an owner, the Safe itself, or not an address anyone holds.
+            TransactionRequest::AddOwner {
+                owner: current.owners[1].clone(),
+                threshold: "2".into(),
+            },
+            TransactionRequest::AddOwner {
+                owner: current.safe_address.clone(),
+                threshold: "2".into(),
+            },
+            TransactionRequest::AddOwner {
+                owner: ZERO.into(),
+                threshold: "2".into(),
+            },
+            TransactionRequest::AddOwner {
+                owner: SENTINEL.into(),
+                threshold: "2".into(),
+            },
+            // A threshold the resulting owner set could not meet.
+            TransactionRequest::AddOwner {
+                owner: fresh.into(),
+                threshold: "5".into(),
+            },
+            TransactionRequest::RemoveOwner {
+                owner: current.owners[0].clone(),
+                threshold: "3".into(),
+            },
+            TransactionRequest::ChangeThreshold {
+                threshold: "4".into(),
+            },
+            TransactionRequest::ChangeThreshold {
+                threshold: "0".into(),
+            },
+            // Not an owner.
+            TransactionRequest::RemoveOwner {
+                owner: fresh.into(),
+                threshold: "1".into(),
+            },
+            TransactionRequest::SwapOwner {
+                old_owner: fresh.into(),
+                new_owner: fresh.into(),
+            },
+            TransactionRequest::SwapOwner {
+                old_owner: current.owners[0].clone(),
+                new_owner: current.owners[1].clone(),
+            },
+        ] {
+            assert!(encode(refused.clone()).is_err(), "{refused:?}");
+        }
+        assert!(encode(TransactionRequest::Rejection).unwrap().is_none());
     }
 
     #[test]
