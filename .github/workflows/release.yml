@@ -22,4 +22,4 @@ jobs:
       petal-tooling-ref: "9ad7a5c635f092bbcdf8f00a06b23676806ff70c"
       build-command: scripts/build.sh
       package-root: .
-      expected-route-count: 17
+      expected-route-count: 21

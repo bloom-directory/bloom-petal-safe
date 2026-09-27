@@ -36,6 +36,9 @@ sol! {
     function performCreate2(uint256 value, bytes deploymentData, bytes32 salt) returns (address newContract);
     function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address payable refundReceiver, bytes signatures) returns (bool success);
     function transfer(address to, uint256 value) returns (bool);
+    function approvedHashes(address owner, bytes32 hash) external view returns (uint256);
+    function setup(address[] owners, uint256 threshold, address to, bytes data, address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver);
+    function createProxyWithNonce(address singleton, bytes initializer, uint256 saltNonce) returns (address proxy);
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -578,6 +581,7 @@ fn api_key_key(wallet: &str, safe_id: &str) -> String {
 const BINDING_PREFIX: &str = "state/safes/";
 const TRANSACTION_PREFIX: &str = "state/transactions/";
 const SERVICE_KEY_PREFIX: &str = "creds/services/";
+const DEPLOYMENT_PREFIX: &str = "state/deployments/";
 /// Listings project stored key names only, so this bounds the key bytes the
 /// host returns rather than any record body.
 const MAX_LIST_BYTES: usize = 256 * 1024;
@@ -642,6 +646,12 @@ pub fn transaction_wallets() -> Result<Vec<String>, DispatchResponse> {
 }
 pub fn transaction_ids(wallet: &str) -> Result<Vec<String>, DispatchResponse> {
     list_records(TRANSACTION_PREFIX, wallet, ".json")
+}
+pub fn deployment_wallets() -> Result<Vec<String>, DispatchResponse> {
+    list_wallets(DEPLOYMENT_PREFIX)
+}
+pub fn deployments(wallet: &str) -> Result<Vec<String>, DispatchResponse> {
+    list_records(DEPLOYMENT_PREFIX, wallet, ".json")
 }
 pub fn service_key_wallets() -> Result<Vec<String>, DispatchResponse> {
     list_wallets(SERVICE_KEY_PREFIX)
@@ -872,6 +882,9 @@ pub fn bind(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
     if body.len() > 16 * 1024 {
         return invalid("binding request is too large");
     }
+    if serde_json::from_slice::<Value>(body).ok() == Some(json!({"remove": true})) {
+        return unbind(wallet, safe_id);
+    }
     let request: BindingRequest = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return invalid(format!("invalid binding JSON: {e}")),
@@ -911,6 +924,41 @@ pub fn bind(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
     match save(&binding_key(wallet, safe_id), &binding) {
         Ok(()) => DispatchResponse::Write,
         Err(e) => e,
+    }
+}
+
+/// Forget a binding. Transactions drafted against it stay stored but can no
+/// longer be signed or executed until the Safe is bound again under this id.
+fn unbind(wallet: &str, safe_id: &str) -> DispatchResponse {
+    match petal::sdk::store_del(&binding_key(wallet, safe_id)) {
+        Ok(()) => DispatchResponse::Write,
+        Err(e) => sdk_error(e),
+    }
+}
+
+/// Forget a transaction and any signature held for it. This does not revoke
+/// a signature that was already published or shared: only executing another
+/// transaction at the same nonce does that.
+pub fn discard(wallet: &str, id: &str) -> DispatchResponse {
+    if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
+    {
+        return e;
+    }
+    let mut state: TransactionState = match load(&tx_key(wallet, id), "Safe transaction") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // Reconciling needs the binding; a transaction whose binding was removed
+    // has nothing left to wait for.
+    let _ = reconcile_execution(&mut state);
+    if state.phase == "execution_staged" && state.execution_status.as_deref() == Some("sent") {
+        return denied(
+            "the outer transaction was broadcast; read status.json until it settles before discarding",
+        );
+    }
+    match petal::sdk::store_del(&tx_key(wallet, id)) {
+        Ok(()) => DispatchResponse::Write,
+        Err(e) => sdk_error(e),
     }
 }
 
@@ -1068,9 +1116,34 @@ fn verified_library(
     ))
 }
 
+/// How far past the Safe's current nonce a transaction may be drafted.
+const MAX_QUEUE_AHEAD: u64 = 64;
+
+/// The Safe nonce a draft is for: the current one unless the draft names a
+/// later one to queue behind transactions that have not executed yet.
+fn draft_nonce(current: &str, requested: Option<&str>) -> Result<String, DispatchResponse> {
+    let Some(requested) = requested else {
+        return Ok(current.into());
+    };
+    let current = uint(current, "current nonce")?;
+    let nonce = uint(requested, "nonce")?;
+    if nonce < current {
+        return Err(denied(format!(
+            "nonce {nonce} is already spent; the Safe is at nonce {current}"
+        )));
+    }
+    if nonce - current > U256::from(MAX_QUEUE_AHEAD) {
+        return Err(denied(format!(
+            "nonce may be at most {MAX_QUEUE_AHEAD} past the Safe's current nonce {current}"
+        )));
+    }
+    Ok(nonce.to_string())
+}
+
 fn build_tx(
     binding: &Binding,
     request: &TransactionRequest,
+    nonce: Option<&str>,
 ) -> Result<(SafeTx, Option<String>, SafeSnapshot), DispatchResponse> {
     let current = inspect(&binding.chain, &binding.safe.safe_address)?;
     if binding.safe.chain_id != current.chain_id
@@ -1227,7 +1300,7 @@ fn build_tx(
         gas_price: "0".into(),
         gas_token: ZERO.into(),
         refund_receiver: ZERO.into(),
-        nonce: current.nonce.clone(),
+        nonce: draft_nonce(&current.nonce, nonce)?,
     };
     Ok((tx, library_hash, current))
 }
@@ -1272,7 +1345,13 @@ pub fn signing_preimage(
     Ok(preimage)
 }
 
-pub fn create_transaction(wallet: &str, safe_id: &str, id: &str, body: &[u8]) -> DispatchResponse {
+pub fn create_transaction(
+    wallet: &str,
+    safe_id: &str,
+    id: &str,
+    nonce: Option<&str>,
+    body: &[u8],
+) -> DispatchResponse {
     if let Err(e) = safe_segment(wallet, "wallet")
         .and_then(|_| safe_segment(safe_id, "safe id"))
         .and_then(|_| safe_segment(id, "transaction id"))
@@ -1290,7 +1369,7 @@ pub fn create_transaction(wallet: &str, safe_id: &str, id: &str, body: &[u8]) ->
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (safe_tx, library_code_hash, snapshot) = match build_tx(&binding, &request) {
+    let (safe_tx, library_code_hash, snapshot) = match build_tx(&binding, &request, nonce) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1437,8 +1516,10 @@ pub fn confirm(ctx: &petal::Ctx, wallet: &str, id: &str) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
+    // A nonce at or past the current one can still execute, so it can be
+    // signed; a spent one cannot.
     if !transaction_context_matches(&binding, &state, &current)
-        || current.nonce != state.safe_tx.nonce
+        || uint(&current.nonce, "current nonce").ok() > uint(&state.safe_tx.nonce, "nonce").ok()
     {
         return denied("Safe configuration or nonce changed; create a new transaction");
     }
@@ -1759,10 +1840,14 @@ fn parse_signature(value: &str) -> Result<Vec<u8>, DispatchResponse> {
     hex_bytes(value, "signature")
 }
 
+/// `approved` reports whether an owner has approved this hash on chain with
+/// `approveHash`. It is asked only while the recoverable signatures fall short
+/// of the threshold, and is how an owner that is itself a contract takes part.
 fn ordered_signatures(
     binding: &Binding,
     state: &TransactionState,
     additional: &[String],
+    approved: &dyn Fn(Address, B256) -> Result<bool, DispatchResponse>,
 ) -> Result<Vec<u8>, DispatchResponse> {
     let hash = keccak256(signing_preimage(
         &binding.safe.chain_id,
@@ -1792,12 +1877,11 @@ fn ordered_signatures(
         record(owner, bytes);
     }
     // Transaction Service confirmations are third-party data and include
-    // signature types this Petal cannot order or re-encode: contract
+    // signature types this Petal does not take from a third party: contract
     // signatures (v=0) carry a dynamic tail whose offsets would have to be
-    // rewritten on sort, and approved-hash entries (v=1) are not recoverable.
-    // Skipping what we cannot use keeps a Safe with such a co-signer
-    // executable whenever the remaining signatures still meet the threshold,
-    // instead of failing the whole batch.
+    // rewritten on sort, and an approved-hash entry (v=1) proves nothing by
+    // itself. Both are skipped; on-chain approvals are read from the Safe
+    // below instead.
     for value in additional {
         let Ok(bytes) = parse_signature(value) else {
             continue;
@@ -1815,9 +1899,21 @@ fn ordered_signatures(
         .threshold
         .parse()
         .map_err(|_| backend("invalid stored threshold"))?;
+    for owner in &owners {
+        if signatures.len() >= threshold {
+            break;
+        }
+        if !signatures.contains_key(owner) && approved(*owner, hash)? {
+            // `{r: owner, s: 0, v: 1}` is how Safe encodes an approved hash.
+            let mut bytes = vec![0u8; 65];
+            bytes[12..32].copy_from_slice(owner.as_slice());
+            bytes[64] = 1;
+            signatures.insert(*owner, bytes);
+        }
+    }
     if signatures.len() < threshold {
         return Err(denied(format!(
-            "Safe threshold requires {threshold} owner signatures; {} supplied",
+            "Safe threshold requires {threshold} owner signatures or on-chain approvals; {} found",
             signatures.len()
         )));
     }
@@ -1858,10 +1954,14 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if !transaction_context_matches(&binding, &state, &current)
-        || current.nonce != state.safe_tx.nonce
-    {
-        return denied("Safe configuration or nonce changed before execution");
+    if !transaction_context_matches(&binding, &state, &current) {
+        return denied("Safe configuration changed before execution");
+    }
+    if current.nonce != state.safe_tx.nonce {
+        return denied(format!(
+            "the Safe is at nonce {}; this transaction is for nonce {} and can execute only then",
+            current.nonce, state.safe_tx.nonce
+        ));
     }
     let preimage = match signing_preimage(
         &binding.safe.chain_id,
@@ -1891,7 +1991,17 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
             Err(e) => service_unavailable = Some(e),
         }
     }
-    let signatures = match ordered_signatures(&binding, &state, &request.signatures) {
+    let approved = |owner: Address, hash: B256| {
+        let result = call(
+            &binding.chain,
+            &binding.safe.safe_address,
+            approvedHashesCall { owner, hash }.abi_encode(),
+        )?;
+        approvedHashesCall::abi_decode_returns(&result)
+            .map(|value| value != U256::ZERO)
+            .map_err(|e| backend(format!("decode approved hash: {e}")))
+    };
+    let signatures = match ordered_signatures(&binding, &state, &request.signatures, &approved) {
         Ok(v) => v,
         Err(e) => return service_unavailable.unwrap_or(e),
     };
@@ -1961,6 +2071,24 @@ fn attempt_ended(phase: &str) -> bool {
     matches!(phase, "execution_failed" | "execution_cancelled")
 }
 
+/// Bring a staged execution up to date with Bloom's outbox.
+fn reconcile_execution(state: &mut TransactionState) -> Result<(), DispatchResponse> {
+    let Some(outbox) = state.outbox_id.clone() else {
+        return Ok(());
+    };
+    let binding: Binding = load(&binding_key(&state.wallet, &state.safe_id), "Safe binding")?;
+    let executor = state.executor_wallet.as_deref().unwrap_or(&state.wallet);
+    if let Ok(inspection) = petal::sdk::tx_inspect(executor, &binding.chain, &outbox) {
+        state.execution_status = Some(inspection.state.clone());
+        state.execution_tx_hash = inspection.tx_hash;
+        if let Some(phase) = execution_phase(&inspection.state) {
+            state.phase = phase.into();
+        }
+        let _ = save(&tx_key(&state.wallet, &state.id), state);
+    }
+    Ok(())
+}
+
 pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
     {
@@ -1970,20 +2098,8 @@ pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if let Some(outbox) = state.outbox_id.clone() {
-        let binding: Binding = match load(&binding_key(wallet, &state.safe_id), "Safe binding") {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let executor = state.executor_wallet.as_deref().unwrap_or(wallet);
-        if let Ok(inspection) = petal::sdk::tx_inspect(executor, &binding.chain, &outbox) {
-            state.execution_status = Some(inspection.state.clone());
-            state.execution_tx_hash = inspection.tx_hash;
-            if let Some(phase) = execution_phase(&inspection.state) {
-                state.phase = phase.into();
-            }
-            let _ = save(&tx_key(wallet, id), &state);
-        }
+    if let Err(e) = reconcile_execution(&mut state) {
+        return e;
     }
     let current_nonce = load::<Binding>(&binding_key(wallet, &state.safe_id), "Safe binding")
         .ok()
@@ -2216,7 +2332,7 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
     out.push_str(match state.phase.as_str() {
         "draft" => "Write `confirm.json` to ask Bloom for this wallet's owner signature. That opens an approval ceremony showing Broker's own reconstruction of the transaction.\n",
         "approval_required" => "An approval ceremony is open. Complete it, then write `confirm.json` again to collect the signature.\n",
-        "signed" => "Write `execute.json` with an executor wallet to stage the outer transaction. The executor pays gas and is a separate approval from the owner signature.\n",
+        "signed" => "Write `execute.json` with an executor wallet to stage the outer transaction. The executor pays gas and is a separate approval from the owner signature. A transaction queued at a later nonce executes only once the Safe reaches that nonce.\n",
         "proposed" => "The transaction is published to the Transaction Service. Collect the remaining confirmations, then write `execute.json`.\n",
         "execution_staged" => "The outer transaction is staged in Bloom's EVM outbox. Approve it as the executor wallet, then read `status.json` until it reaches `executed`, `execution_failed` or `execution_cancelled`.\n",
         "executed" => "Done. `status.json` carries both the Safe transaction hash and the outer transaction hash.\n",
@@ -2248,12 +2364,349 @@ pub fn read_plan(wallet: &str, id: &str) -> DispatchResponse {
     DispatchResponse::Read(plan_markdown(&binding, &state).into_bytes())
 }
 
+/// The official contracts a new Safe is created from. New Safes are 1.4.1 or
+/// 1.5.0; 1.3.0 is supported for existing Safes only.
+#[derive(Clone, Copy)]
+struct Factory {
+    version: &'static str,
+    factory: Library,
+    singleton: &'static str,
+    singleton_l2: &'static str,
+    fallback_handler: Library,
+}
+
+const FACTORIES: &[Factory] = &[
+    Factory {
+        version: "1.4.1",
+        factory: Library {
+            address: "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67",
+            code_hash: "0x50c3cdc4074750a7a974204a716c999edd37482f907608d960b2b025ee0b3317",
+        },
+        singleton: "0x41675c099f32341bf84bfc5382af534df5c7461a",
+        singleton_l2: "0x29fcb43b46531bca003ddc8fcb67ffe91900c762",
+        fallback_handler: Library {
+            address: "0xfd0732dc9e303f09fcef3a7388ad10a83459ec99",
+            code_hash: "0x7c6007a5d711cea8dfd5d91f5940ec29c7f200fe511eb1fc1397b367af3c42f9",
+        },
+    },
+    Factory {
+        version: "1.5.0",
+        factory: Library {
+            address: "0x14f2982d601c9458f93bd70b218933a6f8165e7b",
+            code_hash: "0x967dae4cda22b0c9ef7f31b010bdc1ceb0af9904b0c3dc060b5302e4c18a4529",
+        },
+        singleton: "0xff51a5898e281db6dfc7855790607438df2ca44b",
+        singleton_l2: "0xedd160febbd92e350d4d398fb636302fccd67c7e",
+        fallback_handler: Library {
+            address: "0x3efcbb83a4a7afcb4f68d501e2c2203a38be77f4",
+            code_hash: "0x3c6a85bcf7b563daa624b884b4e9a1b9fa5371edde7be945d998071a48f28bbc",
+        },
+    },
+];
+
+fn default_version() -> String {
+    "1.4.1".into()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentRequest {
+    pub chain: String,
+    #[serde(default = "default_version")]
+    pub version: String,
+    pub owners: Vec<String>,
+    pub threshold: String,
+    #[serde(default = "zero_string")]
+    pub salt_nonce: String,
+    pub executor_wallet: String,
+    #[serde(default)]
+    pub nonce: Option<u64>,
+    #[serde(default)]
+    pub max_fee_per_gas: Option<String>,
+    #[serde(default)]
+    pub max_priority_fee_per_gas: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentState {
+    pub schema: String,
+    pub wallet: String,
+    pub safe_id: String,
+    pub chain: String,
+    pub chain_id: String,
+    pub safe_version: String,
+    pub owners: Vec<String>,
+    pub threshold: String,
+    pub salt_nonce: String,
+    pub factory: String,
+    pub singleton: String,
+    pub fallback_handler: String,
+    pub safe_address: String,
+    pub executor_wallet: String,
+    pub outbox_id: String,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_tx_hash: Option<String>,
+}
+
+fn deployment_key(wallet: &str, safe_id: &str) -> String {
+    format!("{DEPLOYMENT_PREFIX}{wallet}/{safe_id}.json")
+}
+
+/// Owners in the order given, normalized: 1 to 64 distinct addresses, none of
+/// them the zero address or Safe's list sentinel, and a threshold they can meet.
+fn deployment_owners(
+    owners: &[String],
+    threshold: &str,
+) -> Result<(Vec<Address>, U256), DispatchResponse> {
+    if owners.is_empty() || owners.len() > 64 {
+        return Err(invalid("a Safe needs 1 to 64 owners"));
+    }
+    let mut seen = BTreeSet::new();
+    let mut parsed = Vec::with_capacity(owners.len());
+    for owner in owners {
+        let owner = address(owner, "owner")?;
+        if owner == Address::ZERO || owner == address(SENTINEL, "sentinel")? {
+            return Err(invalid("owner is not a usable address"));
+        }
+        if !seen.insert(owner) {
+            return Err(invalid("owners must be distinct"));
+        }
+        parsed.push(owner);
+    }
+    let threshold = uint(threshold, "threshold")?;
+    if threshold == U256::ZERO || threshold > U256::from(parsed.len()) {
+        return Err(invalid("threshold must be between 1 and the owner count"));
+    }
+    Ok((parsed, threshold))
+}
+
+/// `createProxyWithNonce` calldata for a plain Safe: the given owners and
+/// threshold, the official fallback handler, and nothing else. No setup
+/// delegatecall, no module, no payment.
+fn deployment_calldata(
+    singleton: Address,
+    fallback_handler: Address,
+    owners: Vec<Address>,
+    threshold: U256,
+    salt_nonce: U256,
+) -> Vec<u8> {
+    let initializer = setupCall {
+        owners,
+        threshold,
+        to: Address::ZERO,
+        data: Vec::new().into(),
+        fallbackHandler: fallback_handler,
+        paymentToken: Address::ZERO,
+        payment: U256::ZERO,
+        paymentReceiver: Address::ZERO,
+    }
+    .abi_encode();
+    createProxyWithNonceCall {
+        singleton,
+        initializer: initializer.into(),
+        saltNonce: salt_nonce,
+    }
+    .abi_encode()
+}
+
+fn verified_code(chain: &str, contract: &Library, label: &str) -> Result<(), DispatchResponse> {
+    let code = rpc_hex(chain, "eth_getCode", json!([contract.address, "latest"]))?;
+    if format!("{:#x}", keccak256(code)) != contract.code_hash {
+        return Err(denied(format!(
+            "the official Safe {label} is not deployed on this chain"
+        )));
+    }
+    Ok(())
+}
+
+/// Stage the creation of a new Safe. The executor wallet pays for it and
+/// approves it like any other transaction from Bloom's outbox; once it is
+/// mined, bind the Safe at the address this recorded.
+pub fn deploy(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
+    match stage_deployment(wallet, safe_id, body) {
+        Ok(()) => DispatchResponse::Write,
+        Err(e) => e,
+    }
+}
+
+fn stage_deployment(wallet: &str, safe_id: &str, body: &[u8]) -> Result<(), DispatchResponse> {
+    safe_segment(wallet, "wallet")?;
+    safe_segment(safe_id, "safe id")?;
+    if body.len() > 16 * 1024 {
+        return Err(invalid("deployment request is too large"));
+    }
+    let request: DeploymentRequest = serde_json::from_slice(body)
+        .map_err(|e| invalid(format!("invalid deployment JSON: {e}")))?;
+    safe_segment(&request.executor_wallet, "executor_wallet")?;
+    if request.chain.is_empty()
+        || request.chain.len() > 64
+        || !petal::is_safe_segment(&request.chain)
+    {
+        return Err(invalid("chain must be a configured Bloom chain name"));
+    }
+    if let Ok(previous) = load::<DeploymentState>(&deployment_key(wallet, safe_id), "deployment")
+        && !attempt_ended(&deployment_phase(&previous))
+    {
+        return Err(denied(
+            "a deployment is already recorded under this id; use another id",
+        ));
+    }
+    let contracts = FACTORIES
+        .iter()
+        .find(|entry| entry.version == request.version)
+        .ok_or_else(|| invalid("new Safes can be created as version 1.4.1 or 1.5.0"))?;
+    let (owners, threshold) = deployment_owners(&request.owners, &request.threshold)?;
+    let owner = wallet_address(wallet)?;
+    if !owners.iter().any(|v| format!("{v:#x}") == owner) {
+        return Err(denied("the Bloom wallet must be one of the owners"));
+    }
+    let salt_nonce = uint(&request.salt_nonce, "salt_nonce")?;
+    let chain_id = chain_result(&request.chain, "eth_chainId", json!([]))?;
+    let chain_id = chain_id
+        .as_str()
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .filter(|v| *v != 0)
+        .ok_or_else(|| backend("invalid chain ID"))?;
+    // Safe's L2 singleton emits the events indexers rely on away from mainnet.
+    let singleton = if chain_id == 1 {
+        contracts.singleton
+    } else {
+        contracts.singleton_l2
+    };
+    verified_code(&request.chain, &contracts.factory, "proxy factory")?;
+    verified_code(
+        &request.chain,
+        &contracts.fallback_handler,
+        "fallback handler",
+    )?;
+    let singleton_code = rpc_hex(&request.chain, "eth_getCode", json!([singleton, "latest"]))?;
+    if !singleton_supported(
+        contracts.version,
+        singleton,
+        &format!("{:#x}", keccak256(singleton_code)),
+    ) {
+        return Err(denied(
+            "the official Safe singleton is not deployed on this chain",
+        ));
+    }
+    let data = deployment_calldata(
+        address(singleton, "singleton")?,
+        address(contracts.fallback_handler.address, "fallback handler")?,
+        owners.clone(),
+        threshold,
+        salt_nonce,
+    );
+    // The factory itself says where the proxy will land; a revert here means
+    // this exact Safe already exists.
+    let predicted = call(&request.chain, contracts.factory.address, data.clone())
+        .map_err(|_| denied("the factory refused this deployment; the Safe may already exist, so try another salt_nonce"))?;
+    let predicted = createProxyWithNonceCall::abi_decode_returns(&predicted)
+        .map_err(|e| backend(format!("decode predicted Safe address: {e}")))?;
+    let staged = petal::sdk::tx_stage(&petal::EvmTransaction {
+        wallet: request.executor_wallet.clone(),
+        chain: request.chain.clone(),
+        to: contracts.factory.address.into(),
+        value_wei: "0".into(),
+        data_hex: format!("0x{}", hex::encode(data)),
+        nonce: request.nonce,
+        max_fee_per_gas: request.max_fee_per_gas,
+        max_priority_fee_per_gas: request.max_priority_fee_per_gas,
+    })
+    .map_err(sdk_error)?;
+    save(
+        &deployment_key(wallet, safe_id),
+        &DeploymentState {
+            schema: "bloom.safe.deployment.v1".into(),
+            wallet: wallet.into(),
+            safe_id: safe_id.into(),
+            chain: request.chain,
+            chain_id: chain_id.to_string(),
+            safe_version: contracts.version.into(),
+            owners: owners.iter().map(|v| format!("{v:#x}")).collect(),
+            threshold: threshold.to_string(),
+            salt_nonce: salt_nonce.to_string(),
+            factory: contracts.factory.address.into(),
+            singleton: singleton.into(),
+            fallback_handler: contracts.fallback_handler.address.into(),
+            safe_address: format!("{predicted:#x}"),
+            executor_wallet: request.executor_wallet,
+            outbox_id: staged.outbox_id,
+            phase: "deployment_staged".into(),
+            deployment_status: Some("staged".into()),
+            deployment_tx_hash: None,
+        },
+    )
+}
+
+/// The phase a deployment is in given what the outbox last reported.
+fn deployment_phase(state: &DeploymentState) -> String {
+    match state.deployment_status.as_deref().and_then(execution_phase) {
+        Some("executed") => "deployed".into(),
+        Some(phase) => phase.into(),
+        None => state.phase.clone(),
+    }
+}
+
+pub fn read_deployment(wallet: &str, safe_id: &str) -> DispatchResponse {
+    if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(safe_id, "safe id")) {
+        return e;
+    }
+    let mut state: DeploymentState = match load(&deployment_key(wallet, safe_id), "deployment") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Ok(inspection) =
+        petal::sdk::tx_inspect(&state.executor_wallet, &state.chain, &state.outbox_id)
+    {
+        state.deployment_status = Some(inspection.state);
+        state.deployment_tx_hash = inspection.tx_hash;
+        state.phase = deployment_phase(&state);
+        let _ = save(&deployment_key(wallet, safe_id), &state);
+    }
+    // Code at the address is what proves the Safe exists; binding it then
+    // verifies the singleton, owners and threshold from the chain.
+    let deployed = rpc_hex(
+        &state.chain,
+        "eth_getCode",
+        json!([state.safe_address, "latest"]),
+    )
+    .map(|code| !code.is_empty())
+    .ok();
+    if deployed == Some(true) && state.phase != "deployed" {
+        state.phase = "deployed".into();
+        let _ = save(&deployment_key(wallet, safe_id), &state);
+    }
+    let next = match (deployed, state.phase.as_str()) {
+        (Some(true), _) => format!(
+            "The Safe exists. Bind it by writing {{\"chain\":\"{}\",\"safe_address\":\"{}\"}} to safes/{}/{}.json.",
+            state.chain, state.safe_address, state.wallet, state.safe_id
+        ),
+        (_, "deployment_staged") => format!(
+            "Approve outbox entry {} as wallet {}, then read this file again.",
+            state.outbox_id, state.executor_wallet
+        ),
+        _ => "The deployment did not happen. Write this file again to stage a new attempt.".into(),
+    };
+    petal::read_json_value(&json!({"deployment": state, "deployed": deployed, "next": next}))
+}
+
 pub fn set_service_key(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(safe_id, "safe id")) {
         return e;
     }
-    if body.is_empty() || body.len() > 8192 {
-        return invalid("service key must contain 1 to 8192 bytes");
+    // An empty write removes the key.
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return match petal::sdk::store_del(&api_key_key(wallet, safe_id)) {
+            Ok(()) => DispatchResponse::Write,
+            Err(e) => sdk_error(e),
+        };
+    }
+    if body.len() > 8192 {
+        return invalid("service key must contain at most 8192 bytes");
     }
     let key = match std::str::from_utf8(body) {
         Ok(value) => value.trim(),
@@ -2271,6 +2724,8 @@ pub fn set_service_key(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NONE_APPROVED: fn(Address, B256) -> Result<bool, DispatchResponse> = |_, _| Ok(false);
 
     fn tx() -> SafeTx {
         SafeTx {
@@ -2716,6 +3171,83 @@ mod tests {
     }
 
     #[test]
+    fn an_on_chain_approval_counts_toward_the_threshold() {
+        let binding = binding();
+        let mut state = state("signed", TransactionRequest::Rejection);
+        state.owner_signature = None;
+        let approver = address(&binding.safe.owners[2], "owner").unwrap();
+        let others = binding.safe.owners.len() - 1;
+        let threshold: usize = binding.safe.threshold.parse().unwrap();
+        // Every owner but one has approved on chain.
+        let approved = |owner: Address, _: B256| Ok(owner != approver);
+        let ordered = ordered_signatures(&binding, &state, &[], &approved).unwrap();
+        assert_eq!(ordered.len(), 65 * threshold.min(others));
+        for entry in ordered.chunks(65) {
+            assert_eq!(entry[64], 1);
+            assert!(entry[..12].iter().chain(&entry[32..64]).all(|b| *b == 0));
+            assert_ne!(Address::from_slice(&entry[12..32]), approver);
+        }
+        // Owners stay in ascending order, as `checkNSignatures` requires.
+        let owners: Vec<_> = ordered.chunks(65).map(|e| e[12..32].to_vec()).collect();
+        assert!(owners.windows(2).all(|pair| pair[0] < pair[1]));
+        // A third party cannot assert an approval the chain does not hold.
+        let mut claimed = vec![0u8; 65];
+        claimed[12..32].copy_from_slice(approver.as_slice());
+        claimed[64] = 1;
+        let none = |_: Address, _: B256| Ok(false);
+        assert!(
+            ordered_signatures(
+                &binding,
+                &state,
+                &[format!("0x{}", hex::encode(claimed))],
+                &none
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_draft_may_queue_behind_the_current_nonce_but_not_before_it() {
+        assert_eq!(draft_nonce("4", None).unwrap(), "4");
+        assert_eq!(draft_nonce("4", Some("4")).unwrap(), "4");
+        assert_eq!(draft_nonce("4", Some("68")).unwrap(), "68");
+        assert!(draft_nonce("4", Some("3")).is_err());
+        assert!(draft_nonce("4", Some("69")).is_err());
+        assert!(draft_nonce("4", Some("04")).is_err());
+    }
+
+    #[test]
+    fn a_new_safe_is_plain_and_its_owners_are_checked() {
+        let a = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string();
+        let b = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8".to_string();
+        let (owners, threshold) = deployment_owners(&[a.clone(), b.clone()], "2").unwrap();
+        assert!(deployment_owners(&[], "1").is_err());
+        assert!(deployment_owners(&[a.clone(), a.clone()], "1").is_err());
+        assert!(deployment_owners(&[a.clone(), ZERO.into()], "1").is_err());
+        assert!(deployment_owners(&[a.clone(), SENTINEL.into()], "1").is_err());
+        assert!(deployment_owners(std::slice::from_ref(&a), "0").is_err());
+        assert!(deployment_owners(std::slice::from_ref(&a), "2").is_err());
+
+        let singleton = address(FACTORIES[0].singleton, "singleton").unwrap();
+        let handler = address(FACTORIES[0].fallback_handler.address, "handler").unwrap();
+        let data =
+            deployment_calldata(singleton, handler, owners.clone(), threshold, U256::from(7));
+        let outer = createProxyWithNonceCall::abi_decode(&data).unwrap();
+        assert_eq!(outer.singleton, singleton);
+        assert_eq!(outer.saltNonce, U256::from(7));
+        let setup = setupCall::abi_decode(&outer.initializer).unwrap();
+        assert_eq!(setup.owners, owners);
+        assert_eq!(setup.threshold, U256::from(2));
+        assert_eq!(setup.fallbackHandler, handler);
+        // Nothing runs during setup and nothing is paid.
+        assert_eq!(setup.to, Address::ZERO);
+        assert!(setup.data.is_empty());
+        assert_eq!(setup.paymentToken, Address::ZERO);
+        assert_eq!(setup.payment, U256::ZERO);
+        assert_eq!(setup.paymentReceiver, Address::ZERO);
+    }
+
+    #[test]
     fn parses_transaction_builder_raw_data() {
         let request: TransactionRequest = serde_json::from_value(json!({
             "kind":"transaction_builder",
@@ -2853,15 +3385,18 @@ mod tests {
             &state,
             &state.snapshot
         ));
-        let ordered = ordered_signatures(&binding, &state, &[second.into()]).unwrap();
+        let ordered =
+            ordered_signatures(&binding, &state, &[second.into()], &NONE_APPROVED).unwrap();
         assert_eq!(ordered.len(), 130);
         assert_eq!(&ordered[..65], &hex_bytes(second, "signature").unwrap());
-        assert!(ordered_signatures(&binding, &state, &[first.into()]).is_err());
+        assert!(ordered_signatures(&binding, &state, &[first.into()], &NONE_APPROVED).is_err());
 
         // The same owner confirming through `eth_sign` also satisfies the
         // threshold, and its v = 31 is forwarded intact so the Safe recovers
         // it against the prefixed digest.
-        let ordered = ordered_signatures(&binding, &state, &[ETH_SIGN_SECOND.into()]).unwrap();
+        let ordered =
+            ordered_signatures(&binding, &state, &[ETH_SIGN_SECOND.into()], &NONE_APPROVED)
+                .unwrap();
         assert_eq!(ordered.len(), 130);
         assert_eq!(ordered[64], 31);
 
@@ -2871,22 +3406,30 @@ mod tests {
         let mut one_owner = binding.clone();
         one_owner.safe.owners.truncate(1);
         one_owner.safe.threshold = "1".into();
-        let ordered = ordered_signatures(&one_owner, &state, &[second.into()]).unwrap();
+        let ordered =
+            ordered_signatures(&one_owner, &state, &[second.into()], &NONE_APPROVED).unwrap();
         assert_eq!(ordered.len(), 65);
 
         // Bloom's own signature is still held strictly.
         let mut foreign = one_owner.clone();
         foreign.safe.owners = vec![binding.safe.owners[1].clone()];
-        assert!(ordered_signatures(&foreign, &state, &[]).is_err());
+        assert!(ordered_signatures(&foreign, &state, &[], &NONE_APPROVED).is_err());
 
         // Skipped confirmations cannot make up a missing threshold.
         let mut malformed = hex_bytes(second, "signature").unwrap();
         malformed[64] = 29;
         assert!(
-            ordered_signatures(&binding, &state, &[format!("0x{}", hex::encode(malformed))])
-                .is_err()
+            ordered_signatures(
+                &binding,
+                &state,
+                &[format!("0x{}", hex::encode(malformed))],
+                &NONE_APPROVED
+            )
+            .is_err()
         );
-        assert!(ordered_signatures(&binding, &state, &[format!("{second}00")]).is_err());
+        assert!(
+            ordered_signatures(&binding, &state, &[format!("{second}00")], &NONE_APPROVED).is_err()
+        );
     }
 
     /// Owner 0x7099… signing the Safe transaction hash with `eth_sign`; Safe
