@@ -80,7 +80,7 @@ Write `{"safe_id":"treasury","transaction":...}` to `petals/safe/transactions/<w
 {"kind":"rejection"}
 ```
 
-Batches and multi-transaction Builder files use only the pinned canonical `MultiSendCallOnly`. Builder entries may contain raw `data` or a standard `contractMethod` plus `contractInputsValues`; Bloom ABI-encodes scalar, array, and tuple inputs and rejects missing, extra, or invalid values. Deployments use only the pinned canonical `CreateCall`. The Petal reads and hashes the runtime code before drafting. Arbitrary delegatecalls and Safe self-calls are rejected. Refund fields are fixed to zero.
+Batches and multi-transaction Builder files use only the pinned canonical `MultiSendCallOnly`. Builder entries may contain raw `data` or a standard `contractMethod` plus `contractInputsValues`; an entry carrying both is refused unless they encode the same call. Bloom ABI-encodes scalar, array, and tuple inputs and rejects missing, extra, or invalid values. Deployments use only the pinned canonical `CreateCall`. The Petal reads and hashes the runtime code before drafting. Arbitrary delegatecalls and Safe self-calls are rejected. Refund fields are fixed to zero.
 
 ## Read the plan
 
@@ -113,11 +113,17 @@ Write to `.../<transaction-id>/execute.json`:
 }
 ```
 
-When a Transaction Service is configured, confirmations are fetched automatically. Otherwise, add 65-byte EOA owner signatures to `signatures`. Every signature is recovered against `safeTxHash`, checked against current owners, deduplicated, sorted by owner address, and threshold checked. Contract signatures are intentionally unsupported in this release.
+When a Transaction Service is configured, confirmations are fetched automatically and added to any in `signatures`. If the service is unreachable or does not hold the transaction, execution proceeds when the signatures already in hand meet the threshold. Without a service, add 65-byte EOA owner signatures to `signatures`. Every signature is recovered against `safeTxHash`, checked against current owners, deduplicated, sorted by owner address, and threshold checked. Contract signatures are intentionally unsupported in this release.
 
-The encoded `execTransaction` is staged in Bloom's native EVM outbox and requires the normal executor-wallet approval. Confirm that outbox entry as the executor wallet (`bloom wallet confirm <executor> <chain> <outbox_id>`, with `outbox_id` from `status.json`), then read `.../<transaction-id>/execute.json` until its `phase` is `executed` or `execution_failed` to reconcile it: Bloom scopes outbox inspection to the route that staged the entry, so only the execute route can observe the receipt. Every other read of the transaction returns the last reconciled state.
+The encoded `execTransaction` is staged in Bloom's native EVM outbox and requires the normal executor-wallet approval. Confirm that outbox entry as the executor wallet (`bloom wallet confirm <executor> <chain> <outbox_id>`, with `outbox_id` from `status.json`), then read `.../<transaction-id>/status.json` until its `phase` is `executed`, `execution_failed` or `execution_cancelled`.
 
-If the outer transaction reverts or fails, `execute.json` reads `execution_failed`. Write `execute.json` again to stage a new attempt; Bloom refuses it once the Safe nonce has moved.
+If the outer transaction reverts or fails, the phase is `execution_failed`; if the outbox entry is cancelled before broadcast, it is `execution_cancelled`. In either case write `execute.json` again to stage a new attempt; Bloom refuses it once the Safe nonce has moved.
+
+`nonce_conflict` means the Safe nonce was consumed outside this Bloom execution: by another transaction, or by someone else executing this same one.
+
+## Upgrading the Petal
+
+Bloom keeps a Petal's stored state per package. A new version of this Petal starts with no bindings, drafts, held signatures or service keys, and both wallet policies must allow the new package. Execute or abandon open transactions before upgrading, then bind again. Nothing on chain or in the Transaction Service is affected.
 
 ## Hash lifecycle
 
