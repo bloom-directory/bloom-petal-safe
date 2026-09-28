@@ -37,6 +37,10 @@ sol! {
     function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address payable refundReceiver, bytes signatures) returns (bool success);
     function transfer(address to, uint256 value) returns (bool);
     function approvedHashes(address owner, bytes32 hash) external view returns (uint256);
+    function addOwnerWithThreshold(address owner, uint256 threshold);
+    function removeOwner(address prevOwner, address owner, uint256 threshold);
+    function swapOwner(address prevOwner, address oldOwner, address newOwner);
+    function changeThreshold(uint256 threshold);
     function setup(address[] owners, uint256 threshold, address to, bytes data, address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver);
     function createProxyWithNonce(address singleton, bytes initializer, uint256 saltNonce) returns (address proxy);
 }
@@ -163,6 +167,21 @@ pub enum TransactionRequest {
         salt: String,
     },
     Rejection,
+    AddOwner {
+        owner: String,
+        threshold: String,
+    },
+    RemoveOwner {
+        owner: String,
+        threshold: String,
+    },
+    SwapOwner {
+        old_owner: String,
+        new_owner: String,
+    },
+    ChangeThreshold {
+        threshold: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -228,6 +247,10 @@ pub struct TransactionState {
     pub executor_wallet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub library_code_hash: Option<String>,
+    /// The chain the outer transaction is staged on, kept here so a staged
+    /// execution can be followed after its binding is removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_chain: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -948,13 +971,16 @@ pub fn discard(wallet: &str, id: &str) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    // Reconciling needs the binding; a transaction whose binding was removed
-    // has nothing left to wait for.
-    let _ = reconcile_execution(&mut state);
-    if state.phase == "execution_staged" && state.execution_status.as_deref() == Some("sent") {
-        return denied(
-            "the outer transaction was broadcast; read status.json until it settles before discarding",
-        );
+    // A staged outbox entry carries every signature and executes if it is
+    // approved, whether or not this record still exists. Forgetting the
+    // record would hide a transaction that can still happen.
+    if state.outbox_id.is_some() {
+        let current = reconcile_execution(&mut state).unwrap_or(false);
+        if !current || !(state.phase == "executed" || attempt_ended(&state.phase)) {
+            return denied(
+                "an execution is staged in the executor's outbox and can still happen; it can be discarded once it has executed, failed or been cancelled",
+            );
+        }
     }
     match petal::sdk::store_del(&tx_key(wallet, id)) {
         Ok(()) => DispatchResponse::Write,
@@ -1061,7 +1087,7 @@ fn builder_calls(builder: &TransactionBuilderFile) -> Result<Vec<Call>, Dispatch
             let data = match (&transaction.data, &transaction.contract_method) {
                 // The method and its inputs are what a reader of the
                 // file sees, so raw data may not say something else.
-                (Some(data), Some(method)) if transaction.contract_inputs_values.is_some() => {
+                (Some(data), Some(method)) => {
                     let encoded =
                         encode_builder_method(method, transaction.contract_inputs_values.as_ref())?;
                     if hex_bytes(data, "transaction.data")? != encoded {
@@ -1114,6 +1140,106 @@ fn verified_library(
     Err(denied(
         "no supported canonical Safe library deployment has the expected runtime code",
     ))
+}
+
+/// Calldata for one of the four Safe self-calls that change who may sign and
+/// how many must, checked against the owners the Safe has now. Nothing else
+/// about a Safe can be changed from here: modules, guards and the fallback
+/// handler hand the Safe to other code.
+fn owner_change(
+    request: &TransactionRequest,
+    safe: Address,
+    current: &SafeSnapshot,
+) -> Result<Option<Vec<u8>>, DispatchResponse> {
+    let owners = current
+        .owners
+        .iter()
+        .map(|v| address(v, "owner"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sentinel = address(SENTINEL, "sentinel")?;
+    let position = |owner: Address| {
+        owners
+            .iter()
+            .position(|v| *v == owner)
+            .ok_or_else(|| denied(format!("{owner:#x} is not an owner of this Safe")))
+    };
+    // Safe keeps owners in a linked list and needs the entry before the one
+    // being removed; `getOwners` returns them in list order.
+    let previous = |index: usize| {
+        if index == 0 {
+            sentinel
+        } else {
+            owners[index - 1]
+        }
+    };
+    let new_owner = |value: &str| {
+        let owner = address(value, "owner")?;
+        if owner == Address::ZERO || owner == sentinel || owner == safe {
+            return Err(invalid("owner is not a usable address"));
+        }
+        if owners.contains(&owner) {
+            return Err(denied(format!(
+                "{owner:#x} is already an owner of this Safe"
+            )));
+        }
+        Ok(owner)
+    };
+    let threshold = |value: &str, owner_count: usize| {
+        let threshold = uint(value, "threshold")?;
+        if threshold == U256::ZERO || threshold > U256::from(owner_count) {
+            return Err(invalid(format!(
+                "threshold must be between 1 and {owner_count}"
+            )));
+        }
+        Ok(threshold)
+    };
+    Ok(Some(match request {
+        TransactionRequest::AddOwner {
+            owner,
+            threshold: value,
+        } => {
+            if owners.len() >= 64 {
+                return Err(denied("this Safe already has 64 owners"));
+            }
+            addOwnerWithThresholdCall {
+                owner: new_owner(owner)?,
+                threshold: threshold(value, owners.len() + 1)?,
+            }
+            .abi_encode()
+        }
+        TransactionRequest::RemoveOwner {
+            owner,
+            threshold: value,
+        } => {
+            let index = position(address(owner, "owner")?)?;
+            if owners.len() == 1 {
+                return Err(denied("a Safe cannot lose its last owner"));
+            }
+            removeOwnerCall {
+                prevOwner: previous(index),
+                owner: owners[index],
+                threshold: threshold(value, owners.len() - 1)?,
+            }
+            .abi_encode()
+        }
+        TransactionRequest::SwapOwner {
+            old_owner,
+            new_owner: replacement,
+        } => {
+            let index = position(address(old_owner, "old_owner")?)?;
+            swapOwnerCall {
+                prevOwner: previous(index),
+                oldOwner: owners[index],
+                newOwner: new_owner(replacement)?,
+            }
+            .abi_encode()
+        }
+        TransactionRequest::ChangeThreshold { threshold: value } => changeThresholdCall {
+            threshold: threshold(value, owners.len())?,
+        }
+        .abi_encode(),
+        _ => return Ok(None),
+    }))
 }
 
 /// How far past the Safe's current nonce a transaction may be drafted.
@@ -1289,6 +1415,16 @@ fn build_tx(
             )
         }
         TransactionRequest::Rejection => (safe, U256::ZERO, vec![], 0, None),
+        TransactionRequest::AddOwner { .. }
+        | TransactionRequest::RemoveOwner { .. }
+        | TransactionRequest::SwapOwner { .. }
+        | TransactionRequest::ChangeThreshold { .. } => (
+            safe,
+            U256::ZERO,
+            owner_change(request, safe, &current)?.unwrap_or_default(),
+            0,
+            None,
+        ),
     };
     let tx = SafeTx {
         to: format!("{to:#x}"),
@@ -1396,6 +1532,7 @@ pub fn create_transaction(
         execution_status: None,
         executor_wallet: None,
         library_code_hash,
+        execution_chain: None,
     };
     match save_new(&tx_key(wallet, id), &state) {
         Ok(()) => DispatchResponse::Write,
@@ -1524,7 +1661,11 @@ pub fn confirm(ctx: &petal::Ctx, wallet: &str, id: &str) -> DispatchResponse {
         return denied("Safe configuration or nonce changed; create a new transaction");
     }
     if state.owner_signature.is_some() {
-        if binding.transaction_service.is_some() && state.service_status.is_none() {
+        // Once an execution is staged its phase belongs to the outbox.
+        if binding.transaction_service.is_some()
+            && state.service_status.is_none()
+            && state.outbox_id.is_none()
+        {
             match publish(&binding, &state) {
                 Ok(status) => {
                     state.service_status = Some(status);
@@ -1632,7 +1773,8 @@ fn service(
         .as_deref()
         .ok_or_else(|| invalid("this Safe has no Transaction Service"))?;
     let mut headers = vec![("content-type".into(), "application/json".into())];
-    if let Some(key) = api_key(binding, safe_id) {
+    let key = api_key(binding, safe_id);
+    if let Some(key) = &key {
         headers.push(("authorization".into(), format!("Bearer {}", key.trim())));
     }
     let response = petal::sdk::http_fetch(
@@ -1645,7 +1787,14 @@ fn service(
         MAX_BODY,
     )
     .map_err(sdk_error)?;
-    let value = service_body(response.status, &response.body)?;
+    // A service may echo the request; its credential must not reach a message.
+    let body = match &key {
+        Some(key) if !key.trim().is_empty() => String::from_utf8_lossy(&response.body)
+            .replace(key.trim(), "[redacted]")
+            .into_bytes(),
+        _ => response.body,
+    };
+    let value = service_body(response.status, &body)?;
     Ok((response.status, value))
 }
 
@@ -1940,6 +2089,7 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     // reverted, failed or cancelled outer transaction did not execute the Safe
     // transaction, and the nonce check below refuses a new attempt once
     // anything else has spent the nonce.
+    let _ = reconcile_execution(&mut state);
     if state.outbox_id.is_some() && !attempt_ended(&state.phase) {
         return DispatchResponse::Write;
     }
@@ -2045,6 +2195,7 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     state.phase = "execution_staged".into();
     state.execution_status = Some("staged".into());
     state.execution_tx_hash = None;
+    state.execution_chain = Some(binding.chain.clone());
     match save(&tx_key(wallet, id), &state) {
         Ok(()) => DispatchResponse::Write,
         Err(e) => e,
@@ -2071,22 +2222,29 @@ fn attempt_ended(phase: &str) -> bool {
     matches!(phase, "execution_failed" | "execution_cancelled")
 }
 
-/// Bring a staged execution up to date with Bloom's outbox.
-fn reconcile_execution(state: &mut TransactionState) -> Result<(), DispatchResponse> {
+/// Bring a staged execution up to date with Bloom's outbox. `Ok(false)` means
+/// the outbox could not be read, so the stored state may be behind.
+fn reconcile_execution(state: &mut TransactionState) -> Result<bool, DispatchResponse> {
     let Some(outbox) = state.outbox_id.clone() else {
-        return Ok(());
+        return Ok(true);
     };
-    let binding: Binding = load(&binding_key(&state.wallet, &state.safe_id), "Safe binding")?;
+    let chain = match state.execution_chain.clone() {
+        Some(chain) => chain,
+        None => load::<Binding>(&binding_key(&state.wallet, &state.safe_id), "Safe binding")?.chain,
+    };
     let executor = state.executor_wallet.as_deref().unwrap_or(&state.wallet);
-    if let Ok(inspection) = petal::sdk::tx_inspect(executor, &binding.chain, &outbox) {
-        state.execution_status = Some(inspection.state.clone());
-        state.execution_tx_hash = inspection.tx_hash;
-        if let Some(phase) = execution_phase(&inspection.state) {
-            state.phase = phase.into();
-        }
-        let _ = save(&tx_key(&state.wallet, &state.id), state);
+    let Ok(inspection) = petal::sdk::tx_inspect(executor, &chain, &outbox) else {
+        return Ok(false);
+    };
+    state.execution_status = Some(inspection.state.clone());
+    state.execution_tx_hash = inspection.tx_hash;
+    if let Some(phase) = execution_phase(&inspection.state) {
+        state.phase = phase.into();
+    } else if state.phase == "proposed" || state.phase == "signed" {
+        state.phase = "execution_staged".into();
     }
-    Ok(())
+    let _ = save(&tx_key(&state.wallet, &state.id), state);
+    Ok(true)
 }
 
 pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
@@ -2209,6 +2367,8 @@ struct QueueProjection {
 /// observation, and says so. `status.json` is the live view. Reading it starts
 /// no ceremony and signs nothing; Broker's own review, not this file, is what
 /// authorizes a signature.
+const REBIND: &str = "Once this executes the Safe no longer matches its binding. Bind it again before drafting anything else; transactions already queued against the old owners must be drafted again.\n";
+
 fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
     let safe = &state.snapshot;
     let mut out = String::new();
@@ -2258,6 +2418,21 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
         ),
         TransactionRequest::Rejection => {
             "Consume this Safe nonce without doing anything, so that no other transaction at this nonce can execute.\n".into()
+        }
+        TransactionRequest::AddOwner { owner, threshold } => format!(
+            "Add `{owner}` as an owner of this Safe and set the threshold to {threshold}.\n{REBIND}"
+        ),
+        TransactionRequest::RemoveOwner { owner, threshold } => format!(
+            "Remove `{owner}` from this Safe's owners and set the threshold to {threshold}.\n{REBIND}"
+        ),
+        TransactionRequest::SwapOwner {
+            old_owner,
+            new_owner,
+        } => format!(
+            "Replace owner `{old_owner}` with `{new_owner}`. The threshold does not change.\n{REBIND}"
+        ),
+        TransactionRequest::ChangeThreshold { threshold } => {
+            format!("Set this Safe's threshold to {threshold}.\n{REBIND}")
         }
     });
 
@@ -2685,6 +2860,10 @@ pub fn read_deployment(wallet: &str, safe_id: &str) -> DispatchResponse {
             "The Safe exists. Bind it by writing {{\"chain\":\"{}\",\"safe_address\":\"{}\"}} to safes/{}/{}.json.",
             state.chain, state.safe_address, state.wallet, state.safe_id
         ),
+        (_, "deployed") => {
+            "The deployment was mined. Read this file again to confirm the Safe's code is on chain."
+                .into()
+        }
         (_, "deployment_staged") => format!(
             "Approve outbox entry {} as wallet {}, then read this file again.",
             state.outbox_id, state.executor_wallet
@@ -2795,6 +2974,7 @@ mod tests {
             execution_status: None,
             executor_wallet: None,
             library_code_hash: None,
+            execution_chain: None,
         }
     }
 
@@ -3037,6 +3217,7 @@ mod tests {
             execution_status: None,
             executor_wallet: None,
             library_code_hash: None,
+            execution_chain: None,
         };
         let mut response = json!({
             "safe":state.snapshot.safe_address,"to":state.safe_tx.to,"value":"7","data":null,
@@ -3129,6 +3310,10 @@ mod tests {
         };
         let encoded = "0x6b8515ae0000000000000000000000000000000000000000000000000000000000000001";
         assert_eq!(builder_calls(&file(encoded)).unwrap()[0].data, encoded);
+        // A method shown without inputs cannot vouch for raw data either.
+        let mut unverifiable = file(encoded);
+        unverifiable.transactions[0].contract_inputs_values = None;
+        assert!(builder_calls(&unverifiable).is_err());
         // Same method, but the raw data flips the argument the file displays.
         let other = "0x6b8515ae0000000000000000000000000000000000000000000000000000000000000000";
         assert!(builder_calls(&file(other)).is_err());
@@ -3245,6 +3430,99 @@ mod tests {
         assert_eq!(setup.paymentToken, Address::ZERO);
         assert_eq!(setup.payment, U256::ZERO);
         assert_eq!(setup.paymentReceiver, Address::ZERO);
+    }
+
+    #[test]
+    fn owner_changes_encode_against_the_current_owner_list() {
+        let current = snapshot();
+        let safe = address(&current.safe_address, "safe").unwrap();
+        let [first, second, third] = [0, 1, 2].map(|i| address(&current.owners[i], "o").unwrap());
+        let sentinel = address(SENTINEL, "sentinel").unwrap();
+        let fresh = "0x9000000000000000000000000000000000000000";
+        let encode = |request: TransactionRequest| owner_change(&request, safe, &current);
+
+        let data = encode(TransactionRequest::RemoveOwner {
+            owner: current.owners[0].clone(),
+            threshold: "2".into(),
+        })
+        .unwrap()
+        .unwrap();
+        let call = removeOwnerCall::abi_decode(&data).unwrap();
+        assert_eq!((call.prevOwner, call.owner), (sentinel, first));
+
+        let data = encode(TransactionRequest::SwapOwner {
+            old_owner: current.owners[2].clone(),
+            new_owner: fresh.into(),
+        })
+        .unwrap()
+        .unwrap();
+        let call = swapOwnerCall::abi_decode(&data).unwrap();
+        assert_eq!((call.prevOwner, call.oldOwner), (second, third));
+        assert_eq!(call.newOwner, address(fresh, "o").unwrap());
+
+        let data = encode(TransactionRequest::AddOwner {
+            owner: fresh.into(),
+            threshold: "4".into(),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            addOwnerWithThresholdCall::abi_decode(&data)
+                .unwrap()
+                .threshold,
+            U256::from(4)
+        );
+
+        for refused in [
+            // Already an owner, the Safe itself, or not an address anyone holds.
+            TransactionRequest::AddOwner {
+                owner: current.owners[1].clone(),
+                threshold: "2".into(),
+            },
+            TransactionRequest::AddOwner {
+                owner: current.safe_address.clone(),
+                threshold: "2".into(),
+            },
+            TransactionRequest::AddOwner {
+                owner: ZERO.into(),
+                threshold: "2".into(),
+            },
+            TransactionRequest::AddOwner {
+                owner: SENTINEL.into(),
+                threshold: "2".into(),
+            },
+            // A threshold the resulting owner set could not meet.
+            TransactionRequest::AddOwner {
+                owner: fresh.into(),
+                threshold: "5".into(),
+            },
+            TransactionRequest::RemoveOwner {
+                owner: current.owners[0].clone(),
+                threshold: "3".into(),
+            },
+            TransactionRequest::ChangeThreshold {
+                threshold: "4".into(),
+            },
+            TransactionRequest::ChangeThreshold {
+                threshold: "0".into(),
+            },
+            // Not an owner.
+            TransactionRequest::RemoveOwner {
+                owner: fresh.into(),
+                threshold: "1".into(),
+            },
+            TransactionRequest::SwapOwner {
+                old_owner: fresh.into(),
+                new_owner: fresh.into(),
+            },
+            TransactionRequest::SwapOwner {
+                old_owner: current.owners[0].clone(),
+                new_owner: current.owners[1].clone(),
+            },
+        ] {
+            assert!(encode(refused.clone()).is_err(), "{refused:?}");
+        }
+        assert!(encode(TransactionRequest::Rejection).unwrap().is_none());
     }
 
     #[test]
@@ -3372,6 +3650,7 @@ mod tests {
             execution_status: None,
             executor_wallet: None,
             library_code_hash: None,
+            execution_chain: None,
         };
         assert!(transaction_context_matches(
             &binding,
