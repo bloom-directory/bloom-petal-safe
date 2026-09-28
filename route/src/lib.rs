@@ -247,6 +247,10 @@ pub struct TransactionState {
     pub executor_wallet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub library_code_hash: Option<String>,
+    /// The chain the outer transaction is staged on, kept here so a staged
+    /// execution can be followed after its binding is removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_chain: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -967,13 +971,16 @@ pub fn discard(wallet: &str, id: &str) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    // Reconciling needs the binding; a transaction whose binding was removed
-    // has nothing left to wait for.
-    let _ = reconcile_execution(&mut state);
-    if state.phase == "execution_staged" && state.execution_status.as_deref() == Some("sent") {
-        return denied(
-            "the outer transaction was broadcast; read status.json until it settles before discarding",
-        );
+    // A staged outbox entry carries every signature and executes if it is
+    // approved, whether or not this record still exists. Forgetting the
+    // record would hide a transaction that can still happen.
+    if state.outbox_id.is_some() {
+        let current = reconcile_execution(&mut state).unwrap_or(false);
+        if !current || !(state.phase == "executed" || attempt_ended(&state.phase)) {
+            return denied(
+                "an execution is staged in the executor's outbox and can still happen; it can be discarded once it has executed, failed or been cancelled",
+            );
+        }
     }
     match petal::sdk::store_del(&tx_key(wallet, id)) {
         Ok(()) => DispatchResponse::Write,
@@ -1080,7 +1087,7 @@ fn builder_calls(builder: &TransactionBuilderFile) -> Result<Vec<Call>, Dispatch
             let data = match (&transaction.data, &transaction.contract_method) {
                 // The method and its inputs are what a reader of the
                 // file sees, so raw data may not say something else.
-                (Some(data), Some(method)) if transaction.contract_inputs_values.is_some() => {
+                (Some(data), Some(method)) => {
                     let encoded =
                         encode_builder_method(method, transaction.contract_inputs_values.as_ref())?;
                     if hex_bytes(data, "transaction.data")? != encoded {
@@ -1525,6 +1532,7 @@ pub fn create_transaction(
         execution_status: None,
         executor_wallet: None,
         library_code_hash,
+        execution_chain: None,
     };
     match save_new(&tx_key(wallet, id), &state) {
         Ok(()) => DispatchResponse::Write,
@@ -1653,7 +1661,11 @@ pub fn confirm(ctx: &petal::Ctx, wallet: &str, id: &str) -> DispatchResponse {
         return denied("Safe configuration or nonce changed; create a new transaction");
     }
     if state.owner_signature.is_some() {
-        if binding.transaction_service.is_some() && state.service_status.is_none() {
+        // Once an execution is staged its phase belongs to the outbox.
+        if binding.transaction_service.is_some()
+            && state.service_status.is_none()
+            && state.outbox_id.is_none()
+        {
             match publish(&binding, &state) {
                 Ok(status) => {
                     state.service_status = Some(status);
@@ -1761,7 +1773,8 @@ fn service(
         .as_deref()
         .ok_or_else(|| invalid("this Safe has no Transaction Service"))?;
     let mut headers = vec![("content-type".into(), "application/json".into())];
-    if let Some(key) = api_key(binding, safe_id) {
+    let key = api_key(binding, safe_id);
+    if let Some(key) = &key {
         headers.push(("authorization".into(), format!("Bearer {}", key.trim())));
     }
     let response = petal::sdk::http_fetch(
@@ -1774,7 +1787,14 @@ fn service(
         MAX_BODY,
     )
     .map_err(sdk_error)?;
-    let value = service_body(response.status, &response.body)?;
+    // A service may echo the request; its credential must not reach a message.
+    let body = match &key {
+        Some(key) if !key.trim().is_empty() => String::from_utf8_lossy(&response.body)
+            .replace(key.trim(), "[redacted]")
+            .into_bytes(),
+        _ => response.body,
+    };
+    let value = service_body(response.status, &body)?;
     Ok((response.status, value))
 }
 
@@ -2069,6 +2089,7 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     // reverted, failed or cancelled outer transaction did not execute the Safe
     // transaction, and the nonce check below refuses a new attempt once
     // anything else has spent the nonce.
+    let _ = reconcile_execution(&mut state);
     if state.outbox_id.is_some() && !attempt_ended(&state.phase) {
         return DispatchResponse::Write;
     }
@@ -2174,6 +2195,7 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     state.phase = "execution_staged".into();
     state.execution_status = Some("staged".into());
     state.execution_tx_hash = None;
+    state.execution_chain = Some(binding.chain.clone());
     match save(&tx_key(wallet, id), &state) {
         Ok(()) => DispatchResponse::Write,
         Err(e) => e,
@@ -2200,22 +2222,29 @@ fn attempt_ended(phase: &str) -> bool {
     matches!(phase, "execution_failed" | "execution_cancelled")
 }
 
-/// Bring a staged execution up to date with Bloom's outbox.
-fn reconcile_execution(state: &mut TransactionState) -> Result<(), DispatchResponse> {
+/// Bring a staged execution up to date with Bloom's outbox. `Ok(false)` means
+/// the outbox could not be read, so the stored state may be behind.
+fn reconcile_execution(state: &mut TransactionState) -> Result<bool, DispatchResponse> {
     let Some(outbox) = state.outbox_id.clone() else {
-        return Ok(());
+        return Ok(true);
     };
-    let binding: Binding = load(&binding_key(&state.wallet, &state.safe_id), "Safe binding")?;
+    let chain = match state.execution_chain.clone() {
+        Some(chain) => chain,
+        None => load::<Binding>(&binding_key(&state.wallet, &state.safe_id), "Safe binding")?.chain,
+    };
     let executor = state.executor_wallet.as_deref().unwrap_or(&state.wallet);
-    if let Ok(inspection) = petal::sdk::tx_inspect(executor, &binding.chain, &outbox) {
-        state.execution_status = Some(inspection.state.clone());
-        state.execution_tx_hash = inspection.tx_hash;
-        if let Some(phase) = execution_phase(&inspection.state) {
-            state.phase = phase.into();
-        }
-        let _ = save(&tx_key(&state.wallet, &state.id), state);
+    let Ok(inspection) = petal::sdk::tx_inspect(executor, &chain, &outbox) else {
+        return Ok(false);
+    };
+    state.execution_status = Some(inspection.state.clone());
+    state.execution_tx_hash = inspection.tx_hash;
+    if let Some(phase) = execution_phase(&inspection.state) {
+        state.phase = phase.into();
+    } else if state.phase == "proposed" || state.phase == "signed" {
+        state.phase = "execution_staged".into();
     }
-    Ok(())
+    let _ = save(&tx_key(&state.wallet, &state.id), state);
+    Ok(true)
 }
 
 pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
@@ -2831,6 +2860,10 @@ pub fn read_deployment(wallet: &str, safe_id: &str) -> DispatchResponse {
             "The Safe exists. Bind it by writing {{\"chain\":\"{}\",\"safe_address\":\"{}\"}} to safes/{}/{}.json.",
             state.chain, state.safe_address, state.wallet, state.safe_id
         ),
+        (_, "deployed") => {
+            "The deployment was mined. Read this file again to confirm the Safe's code is on chain."
+                .into()
+        }
         (_, "deployment_staged") => format!(
             "Approve outbox entry {} as wallet {}, then read this file again.",
             state.outbox_id, state.executor_wallet
@@ -2941,6 +2974,7 @@ mod tests {
             execution_status: None,
             executor_wallet: None,
             library_code_hash: None,
+            execution_chain: None,
         }
     }
 
@@ -3183,6 +3217,7 @@ mod tests {
             execution_status: None,
             executor_wallet: None,
             library_code_hash: None,
+            execution_chain: None,
         };
         let mut response = json!({
             "safe":state.snapshot.safe_address,"to":state.safe_tx.to,"value":"7","data":null,
@@ -3275,6 +3310,10 @@ mod tests {
         };
         let encoded = "0x6b8515ae0000000000000000000000000000000000000000000000000000000000000001";
         assert_eq!(builder_calls(&file(encoded)).unwrap()[0].data, encoded);
+        // A method shown without inputs cannot vouch for raw data either.
+        let mut unverifiable = file(encoded);
+        unverifiable.transactions[0].contract_inputs_values = None;
+        assert!(builder_calls(&unverifiable).is_err());
         // Same method, but the raw data flips the argument the file displays.
         let other = "0x6b8515ae0000000000000000000000000000000000000000000000000000000000000000";
         assert!(builder_calls(&file(other)).is_err());
@@ -3611,6 +3650,7 @@ mod tests {
             execution_status: None,
             executor_wallet: None,
             library_code_hash: None,
+            execution_chain: None,
         };
         assert!(transaction_context_matches(
             &binding,

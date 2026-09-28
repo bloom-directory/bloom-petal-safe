@@ -104,7 +104,7 @@ Write `{"safe_id":"treasury","transaction":...}` to `petals/safe/transactions/<w
 {"kind":"change_threshold","threshold":"2"}
 ```
 
-Batches and multi-transaction Builder files use only the pinned canonical `MultiSendCallOnly`. Builder entries may contain raw `data` or a standard `contractMethod` plus `contractInputsValues`; an entry carrying both is refused unless they encode the same call. Bloom ABI-encodes scalar, array, and tuple inputs and rejects missing, extra, or invalid values. Deployments use only the pinned canonical `CreateCall`. The Petal reads and hashes the runtime code before drafting. Arbitrary delegatecalls are rejected, and so is every Safe self-call other than a rejection and the four owner and threshold changes.
+Batches and multi-transaction Builder files use only the pinned canonical `MultiSendCallOnly`. Builder entries may contain raw `data` or a standard `contractMethod` plus `contractInputsValues`; an entry carrying both is refused unless the method and its inputs encode exactly that data. Bloom ABI-encodes scalar, array, and tuple inputs and rejects missing, extra, or invalid values. Deployments use only the pinned canonical `CreateCall`. The Petal reads and hashes the runtime code before drafting. Arbitrary delegatecalls are rejected, and so is every Safe self-call other than a rejection and the four owner and threshold changes.
 
 An owner or threshold change is checked against the Safe's current owners, and Broker shows it decoded, with a warning when it removes this Bloom wallet. Once it executes, the Safe no longer matches its binding: bind it again, and draft again anything queued against the old owners. Refund fields are fixed to zero.
 
@@ -155,7 +155,7 @@ If the outer transaction reverts or fails, the phase is `execution_failed`; if t
 .../service-keys/<wallet>/<safe-id>                       write an empty body: remove the key
 ```
 
-Discarding does not revoke a signature that was already published or shared. Only executing another transaction at the same nonce, such as a rejection, does that.
+A transaction with an execution staged in the executor's outbox cannot be discarded until that execution has executed, failed or been cancelled: the staged entry carries every signature and executes if approved. Discarding does not revoke a signature that was already published or shared. Only executing another transaction at the same nonce, such as a rejection, does that.
 
 ## Upgrading the Petal
 
