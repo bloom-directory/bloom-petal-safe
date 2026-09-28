@@ -1004,6 +1004,54 @@ fn encode_batch(calls: &[Call], safe: &str) -> Result<Vec<u8>, DispatchResponse>
     .abi_encode())
 }
 
+/// The calls a Transaction Builder file describes, in order.
+fn builder_calls(builder: &TransactionBuilderFile) -> Result<Vec<Call>, DispatchResponse> {
+    builder
+        .transactions
+        .iter()
+        .map(|transaction| {
+            let data = match (&transaction.data, &transaction.contract_method) {
+                // The method and its inputs are what a reader of the
+                // file sees, so raw data may not say something else.
+                (Some(data), Some(method)) if transaction.contract_inputs_values.is_some() => {
+                    let encoded =
+                        encode_builder_method(method, transaction.contract_inputs_values.as_ref())?;
+                    if hex_bytes(data, "transaction.data")? != encoded {
+                        return Err(denied(
+                            "Transaction Builder data differs from its contractMethod and inputs",
+                        ));
+                    }
+                    data.clone()
+                }
+                (Some(data), _) => data.clone(),
+                (None, None) => empty_hex(),
+                (None, Some(method)) => format!(
+                    "0x{}",
+                    hex::encode(encode_builder_method(
+                        method,
+                        transaction.contract_inputs_values.as_ref()
+                    )?)
+                ),
+            };
+            if transaction
+                .contract_method
+                .as_ref()
+                .is_some_and(|method| !method.payable)
+                && uint(&transaction.value, "transaction.value")? != U256::ZERO
+            {
+                return Err(invalid(
+                    "Transaction Builder sends value to a nonpayable method",
+                ));
+            }
+            Ok(Call {
+                to: transaction.to.clone(),
+                value: transaction.value.clone(),
+                data,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
 fn verified_library(
     chain: &str,
     candidates: &'static [Library],
@@ -1094,38 +1142,7 @@ fn build_tx(
                     "Transaction Builder Safe address does not match this Safe",
                 ));
             }
-            let calls = builder
-                .transactions
-                .iter()
-                .map(|transaction| {
-                    let data = match (&transaction.data, &transaction.contract_method) {
-                        (Some(data), _) => data.clone(),
-                        (None, None) => empty_hex(),
-                        (None, Some(method)) => format!(
-                            "0x{}",
-                            hex::encode(encode_builder_method(
-                                method,
-                                transaction.contract_inputs_values.as_ref()
-                            )?)
-                        ),
-                    };
-                    if transaction
-                        .contract_method
-                        .as_ref()
-                        .is_some_and(|method| !method.payable)
-                        && uint(&transaction.value, "transaction.value")? != U256::ZERO
-                    {
-                        return Err(invalid(
-                            "Transaction Builder sends value to a nonpayable method",
-                        ));
-                    }
-                    Ok(Call {
-                        to: transaction.to.clone(),
-                        value: transaction.value.clone(),
-                        data,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let calls = builder_calls(builder)?;
             if calls.len() == 1 {
                 let call = &calls[0];
                 let to = address(&call.to, "transaction.to")?;
@@ -1704,6 +1721,40 @@ fn publish(binding: &Binding, state: &TransactionState) -> Result<String, Dispat
     Ok("proposed".into())
 }
 
+/// Signatures the service holds for this exact transaction. A record whose
+/// fields differ is refused outright rather than skipped.
+fn service_confirmations(
+    value: &Value,
+    state: &TransactionState,
+) -> Result<Vec<String>, DispatchResponse> {
+    if !service_tx_matches(value, state) {
+        return Err(denied(
+            "Transaction Service returned different Safe transaction fields",
+        ));
+    }
+    let confirmations = value
+        .get("confirmations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| backend("Transaction Service omitted confirmations"))?;
+    if confirmations.len() > 64 {
+        return Err(denied(
+            "Transaction Service returned too many confirmations",
+        ));
+    }
+    confirmations
+        .iter()
+        .map(|confirmation| {
+            confirmation
+                .get("signature")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    denied("Transaction Service returned a confirmation without a signature")
+                })
+        })
+        .collect()
+}
+
 fn parse_signature(value: &str) -> Result<Vec<u8>, DispatchResponse> {
     hex_bytes(value, "signature")
 }
@@ -1778,6 +1829,9 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     {
         return e;
     }
+    if body.len() > MAX_BODY {
+        return invalid("execution request is too large");
+    }
     let mut request: ExecuteRequest = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return invalid(format!("invalid execution JSON: {e}")),
@@ -1786,11 +1840,15 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    // A staged attempt is final unless it failed: a reverted or failed outer
-    // transaction did not execute the Safe transaction, and the nonce check
-    // below refuses a new attempt once anything else has spent the nonce.
-    if state.outbox_id.is_some() && state.phase != "execution_failed" {
+    // A staged attempt is final unless it ended without executing: a
+    // reverted, failed or cancelled outer transaction did not execute the Safe
+    // transaction, and the nonce check below refuses a new attempt once
+    // anything else has spent the nonce.
+    if state.outbox_id.is_some() && !attempt_ended(&state.phase) {
         return DispatchResponse::Write;
+    }
+    if let Err(e) = safe_segment(&request.executor_wallet, "executor_wallet") {
+        return e;
     }
     let binding: Binding = match load(&binding_key(wallet, &state.safe_id), "Safe binding") {
         Ok(v) => v,
@@ -1816,37 +1874,26 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     if format!("{:#x}", keccak256(preimage)) != state.safe_tx_hash {
         return backend("stored Safe transaction hash is inconsistent");
     }
+    // The service only supplies co-owner signatures. When it is unreachable
+    // or does not hold this transaction, the signatures already in hand may
+    // still meet the threshold; its failure is reported only if they do not.
+    let mut service_unavailable = None;
     if binding.transaction_service.is_some() {
         let path = format!("/api/v1/multisig-transactions/{}/", state.safe_tx_hash);
-        let (status, value) = match service(&binding, &state.safe_id, "GET", &path, vec![]) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        if status != 200 || !service_tx_matches(&value, &state) {
-            return denied("Transaction Service did not return the exact Safe transaction");
-        }
-        let confirmations = match value.get("confirmations").and_then(Value::as_array) {
-            Some(v) => v,
-            None => return backend("Transaction Service omitted confirmations"),
-        };
-        if confirmations.len() > 64 {
-            return denied("Transaction Service returned too many confirmations");
-        }
-        for confirmation in confirmations {
-            let signature = match confirmation.get("signature").and_then(Value::as_str) {
-                Some(v) => v,
-                None => {
-                    return denied(
-                        "Transaction Service returned a confirmation without a signature",
-                    );
-                }
-            };
-            request.signatures.push(signature.into());
+        match service(&binding, &state.safe_id, "GET", &path, vec![]) {
+            Ok((200, value)) => match service_confirmations(&value, &state) {
+                Ok(confirmations) => request.signatures.extend(confirmations),
+                Err(e) => return e,
+            },
+            Ok((status, value)) => {
+                service_unavailable = Some(service_failure("lookup", status, &value));
+            }
+            Err(e) => service_unavailable = Some(e),
         }
     }
     let signatures = match ordered_signatures(&binding, &state, &request.signatures) {
         Ok(v) => v,
-        Err(e) => return e,
+        Err(e) => return service_unavailable.unwrap_or(e),
     };
     let data = execTransactionCall {
         to: match address(&state.safe_tx.to, "to") {
@@ -1897,12 +1944,21 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
 /// Bloom's EVM outbox reports `pending`, `sent`, `success`, `reverted`,
 /// `failed`, or `cancelled`; a receipt's outcome is `success` or `reverted`.
 /// `success` is the only state that proves the Safe transaction executed.
+/// Bloom cancels only an entry it never broadcast, so a cancelled attempt can
+/// no longer reach the chain.
 fn execution_phase(outbox_state: &str) -> Option<&'static str> {
     match outbox_state {
         "success" => Some("executed"),
         "reverted" | "failed" => Some("execution_failed"),
+        "cancelled" => Some("execution_cancelled"),
         _ => None,
     }
+}
+
+/// An attempt that ended without executing the Safe transaction. A new one
+/// may be staged; the Safe nonce keeps any two attempts from both executing.
+fn attempt_ended(phase: &str) -> bool {
+    matches!(phase, "execution_failed" | "execution_cancelled")
 }
 
 pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
@@ -1934,10 +1990,10 @@ pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
         .and_then(|binding| inspect(&binding.chain, &binding.safe.safe_address).ok())
         .map(|snapshot| snapshot.nonce);
     // While our own execution is in flight the nonce advancing is the expected
-    // outcome, not a conflict; only a failed or never-staged execution makes
+    // outcome, not a conflict; only an ended or never-staged execution makes
     // an advanced nonce mean someone else spent it.
     let execution_in_flight =
-        state.outbox_id.is_some() && state.phase != "executed" && state.phase != "execution_failed";
+        state.outbox_id.is_some() && state.phase != "executed" && !attempt_ended(&state.phase);
     let nonce_conflict = current_nonce.as_deref().is_some_and(|current| {
         uint(current, "current nonce").ok() > uint(&state.safe_tx.nonce, "transaction nonce").ok()
             && state.phase != "executed"
@@ -2000,7 +2056,9 @@ fn queue_and_history(wallet: &str, safe_id: &str) -> Result<QueueProjection, Dis
             execution_tx_hash: state.execution_tx_hash.clone(),
         };
         match state.phase.as_str() {
-            "executed" | "execution_failed" | "nonce_conflict" => history.push(entry),
+            "executed" | "execution_failed" | "execution_cancelled" | "nonce_conflict" => {
+                history.push(entry)
+            }
             _ => pending.push(entry),
         }
     }
@@ -2160,10 +2218,11 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
         "approval_required" => "An approval ceremony is open. Complete it, then write `confirm.json` again to collect the signature.\n",
         "signed" => "Write `execute.json` with an executor wallet to stage the outer transaction. The executor pays gas and is a separate approval from the owner signature.\n",
         "proposed" => "The transaction is published to the Transaction Service. Collect the remaining confirmations, then write `execute.json`.\n",
-        "execution_staged" => "The outer transaction is staged in Bloom's EVM outbox. Approve it as the executor wallet, then read `execute.json` until it reaches `executed` or `execution_failed`.\n",
+        "execution_staged" => "The outer transaction is staged in Bloom's EVM outbox. Approve it as the executor wallet, then read `status.json` until it reaches `executed`, `execution_failed` or `execution_cancelled`.\n",
         "executed" => "Done. `status.json` carries both the Safe transaction hash and the outer transaction hash.\n",
         "execution_failed" => "The outer transaction did not execute. If the Safe nonce is unchanged, write `execute.json` again to stage a new attempt; Bloom refuses it once anything else has spent the nonce.\n",
-        "nonce_conflict" => "Another transaction consumed this Safe nonce. This draft can no longer execute; draft a replacement at the current nonce.\n",
+        "execution_cancelled" => "The outer transaction was cancelled before it was broadcast. If the Safe nonce is unchanged, write `execute.json` again to stage a new attempt.\n",
+        "nonce_conflict" => "This Safe nonce was consumed outside this Bloom execution, by another transaction or by someone else executing this one. This draft can no longer execute here; if it did not happen, draft a replacement at the current nonce.\n",
         _ => "Read `status.json` for the current phase.\n",
     });
 
@@ -2391,6 +2450,7 @@ mod tests {
             "execution_staged",
             "executed",
             "execution_failed",
+            "execution_cancelled",
             "nonce_conflict",
         ] {
             let plan = plan_markdown(&binding, &state(phase, TransactionRequest::Rejection));
@@ -2597,6 +2657,62 @@ mod tests {
         assert!(!message.contains(&signature[2..]));
         assert!(message.contains("0x[redacted] is invalid"));
         assert!(message.contains("0x977667F2D703138D8C8419531BCBE177c2D78c7d"));
+    }
+
+    #[test]
+    fn transaction_builder_data_must_agree_with_its_method_and_inputs() {
+        let file = |data: &str| -> TransactionBuilderFile {
+            serde_json::from_value(json!({
+                "chainId":"1",
+                "transactions":[{
+                    "to":"0x4000000000000000000000000000000000000000","value":"0","data":data,
+                    "contractMethod":{"inputs":[{"name":"newValue","type":"bool"}],"name":"testBooleanValue","payable":false},
+                    "contractInputsValues":{"newValue":"true"}
+                }]
+            }))
+            .unwrap()
+        };
+        let encoded = "0x6b8515ae0000000000000000000000000000000000000000000000000000000000000001";
+        assert_eq!(builder_calls(&file(encoded)).unwrap()[0].data, encoded);
+        // Same method, but the raw data flips the argument the file displays.
+        let other = "0x6b8515ae0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(builder_calls(&file(other)).is_err());
+    }
+
+    #[test]
+    fn service_confirmations_require_the_exact_transaction() {
+        let mut state = state("signed", TransactionRequest::Rejection);
+        state.safe_tx = tx();
+        state.safe_tx_hash = format!(
+            "{:#x}",
+            keccak256(
+                signing_preimage(
+                    &state.snapshot.chain_id,
+                    &state.snapshot.safe_address,
+                    &tx()
+                )
+                .unwrap()
+            )
+        );
+        let record = |to: &str| {
+            json!({
+                "safe":state.snapshot.safe_address,"to":to,"value":"7","data":null,"operation":0,
+                "safeTxGas":0,"baseGas":0,"gasPrice":"0","gasToken":ZERO,"refundReceiver":ZERO,
+                "nonce":4,"safeTxHash":state.safe_tx_hash,
+                "confirmations":[{"signature":"0x01"},{"signature":"0x02"}]
+            })
+        };
+        assert_eq!(
+            service_confirmations(&record(&state.safe_tx.to), &state).unwrap(),
+            ["0x01", "0x02"]
+        );
+        assert!(
+            service_confirmations(
+                &record("0x5000000000000000000000000000000000000000"),
+                &state
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2809,7 +2925,11 @@ mod tests {
         assert_eq!(execution_phase("failed"), Some("execution_failed"));
         assert!(execution_phase("pending").is_none());
         assert!(execution_phase("sent").is_none());
-        assert!(execution_phase("cancelled").is_none());
+        assert_eq!(execution_phase("cancelled"), Some("execution_cancelled"));
+        assert!(attempt_ended("execution_failed"));
+        assert!(attempt_ended("execution_cancelled"));
+        assert!(!attempt_ended("execution_staged"));
+        assert!(!attempt_ended("executed"));
     }
 
     #[test]
