@@ -952,7 +952,9 @@ pub fn bind(wallet: &str, index: &str, safe_id: &str, body: &[u8]) -> DispatchRe
         Err(e) => return e,
     };
     if !safe.owners.iter().any(|v| v == &owner) {
-        return denied("Bloom wallet is not an owner of this Safe");
+        return denied(format!(
+            "account {index} of this wallet ({owner}) is not an owner of this Safe"
+        ));
     }
     let transaction_service = match validate_service(request.transaction_service) {
         Ok(v) => v,
@@ -2774,7 +2776,9 @@ fn stage_deployment(
     let (owners, threshold) = deployment_owners(&request.owners, &request.threshold)?;
     let owner = wallet_address(wallet, index)?;
     if !owners.iter().any(|v| format!("{v:#x}") == owner) {
-        return Err(denied("the Bloom wallet must be one of the owners"));
+        return Err(denied(format!(
+            "account {index} of this wallet ({owner}) must be one of the owners"
+        )));
     }
     let salt_nonce = uint(&request.salt_nonce, "salt_nonce")?;
     let chain_id = chain_result(&request.chain, "eth_chainId", json!([]))?;
