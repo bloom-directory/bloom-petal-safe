@@ -1091,7 +1091,7 @@ fn encode_batch(calls: &[Call], safe: &str) -> Result<Vec<u8>, DispatchResponse>
     let mut packed = Vec::new();
     for call in calls {
         let to = address(&call.to, "call.to")?;
-        if to == safe {
+        if to == safe || to == Address::ZERO {
             return Err(denied("Safe self-calls are not supported"));
         }
         let value = uint(&call.value, "call.value")?;
@@ -1160,6 +1160,13 @@ fn verified_library(
     chain: &str,
     candidates: &'static [Library],
 ) -> Result<(Library, String), DispatchResponse> {
+    let chain_id = chain_result(chain, "eth_chainId", json!([]))?;
+    let chain_id = chain_id
+        .as_str()
+        .ok_or_else(|| backend("eth_chainId did not return hex"))?;
+    let chain_id = u64::from_str_radix(chain_id.trim_start_matches("0x"), 16)
+        .map_err(|_| backend("eth_chainId did not return a supported chain ID"))?;
+    require_verified_library_chain(chain_id)?;
     for library in candidates {
         let code = rpc_hex(chain, "eth_getCode", json!([library.address, "latest"]))?;
         let observed = format!("{:#x}", keccak256(code));
@@ -1170,6 +1177,14 @@ fn verified_library(
     Err(denied(
         "no supported canonical Safe library deployment has the expected runtime code",
     ))
+}
+
+fn require_verified_library_chain(chain_id: u64) -> Result<(), DispatchResponse> {
+    if [1, 10, 100, 137, 8453, 42161].contains(&chain_id) {
+        Ok(())
+    } else {
+        Err(denied("no verified Safe library deployment on this chain"))
+    }
 }
 
 /// Calldata for one of the four Safe self-calls that change who may sign and
@@ -3175,6 +3190,12 @@ mod tests {
 
     #[test]
     fn batch_encoding_is_call_only_and_bounded() {
+        for chain_id in [1, 10, 100, 137, 8453, 42161] {
+            assert!(require_verified_library_chain(chain_id).is_ok());
+        }
+        for chain_id in [0, 56, 31337, u64::MAX] {
+            assert!(require_verified_library_chain(chain_id).is_err());
+        }
         let (multisend, create) = libraries("1.3.0").unwrap();
         assert_eq!(multisend.len(), 2);
         assert_eq!(create.len(), 2);
@@ -3195,6 +3216,18 @@ mod tests {
             data: "0x".into(),
         }];
         assert!(encode_batch(&self_call, "0x1000000000000000000000000000000000000000").is_err());
+        let zero_self_call = vec![Call {
+            to: ZERO.into(),
+            value: "0".into(),
+            data: "0x610b5925".into(),
+        }];
+        assert!(
+            encode_batch(
+                &zero_self_call,
+                "0x1000000000000000000000000000000000000000"
+            )
+            .is_err()
+        );
     }
 
     #[test]
