@@ -244,8 +244,6 @@ pub struct TransactionState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub executor_wallet: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub library_code_hash: Option<String>,
     /// The chain the outer transaction is staged on, kept here so a staged
     /// execution can be followed after its binding is removed.
@@ -256,7 +254,6 @@ pub struct TransactionState {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecuteRequest {
-    pub executor_wallet: String,
     #[serde(default)]
     pub signatures: Vec<String>,
     #[serde(default)]
@@ -579,10 +576,27 @@ fn encode_builder_method(
     Ok(data)
 }
 
-fn wallet_address(wallet: &str) -> Result<String, DispatchResponse> {
-    let bytes =
-        // Account 0 is the key exact signing uses when no key ref is named.
-        petal::sdk::vfs_read(&format!("wallets/{wallet}/0/address.evm"), 128).map_err(sdk_error)?;
+/// The account number Bloom mounted this route under, as it is spelled in the
+/// path. Bloom resolves `[index]` against its own wallet projection before the
+/// Petal runs; this rejects the spellings that would otherwise reach a store
+/// key or an address path by two different names.
+fn validate_index(index: &str) -> Result<u32, DispatchResponse> {
+    let canonical = !index.is_empty()
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && (index == "0" || !index.starts_with('0'));
+    canonical
+        .then(|| index.parse::<u32>().ok())
+        .flatten()
+        .filter(|number| *number < (1_u32 << 31))
+        .ok_or_else(|| invalid("index must be the wallet's account number as a canonical decimal"))
+}
+
+/// The EVM address of the account this route is mounted under. Bloom derives
+/// the signing key from the same account, so reading any other one would check
+/// ownership against an address that will not sign.
+fn wallet_address(wallet: &str, index: u32) -> Result<String, DispatchResponse> {
+    let bytes = petal::sdk::vfs_read(&format!("wallets/{wallet}/{index}/address.evm"), 128)
+        .map_err(sdk_error)?;
     let value = std::str::from_utf8(&bytes)
         .map_err(|_| backend("wallet address is not UTF-8"))?
         .trim();
@@ -661,19 +675,22 @@ pub fn list_records(
 pub fn bound_wallets() -> Result<Vec<String>, DispatchResponse> {
     list_wallets(BINDING_PREFIX)
 }
-pub fn bound_safes(wallet: &str) -> Result<Vec<String>, DispatchResponse> {
+pub fn bound_safes(wallet: &str, index: &str) -> Result<Vec<String>, DispatchResponse> {
+    validate_index(index)?;
     list_records(BINDING_PREFIX, wallet, ".json")
 }
 pub fn transaction_wallets() -> Result<Vec<String>, DispatchResponse> {
     list_wallets(TRANSACTION_PREFIX)
 }
-pub fn transaction_ids(wallet: &str) -> Result<Vec<String>, DispatchResponse> {
+pub fn transaction_ids(wallet: &str, index: &str) -> Result<Vec<String>, DispatchResponse> {
+    validate_index(index)?;
     list_records(TRANSACTION_PREFIX, wallet, ".json")
 }
 pub fn deployment_wallets() -> Result<Vec<String>, DispatchResponse> {
     list_wallets(DEPLOYMENT_PREFIX)
 }
-pub fn deployments(wallet: &str) -> Result<Vec<String>, DispatchResponse> {
+pub fn deployments(wallet: &str, index: &str) -> Result<Vec<String>, DispatchResponse> {
+    validate_index(index)?;
     list_records(DEPLOYMENT_PREFIX, wallet, ".json")
 }
 pub fn service_key_wallets() -> Result<Vec<String>, DispatchResponse> {
@@ -681,7 +698,8 @@ pub fn service_key_wallets() -> Result<Vec<String>, DispatchResponse> {
 }
 /// Safes this wallet has configured a service key for. The key itself is never
 /// read; only the name of the record it is stored under.
-pub fn service_key_safes(wallet: &str) -> Result<Vec<String>, DispatchResponse> {
+pub fn service_key_safes(wallet: &str, index: &str) -> Result<Vec<String>, DispatchResponse> {
+    validate_index(index)?;
     list_records(SERVICE_KEY_PREFIX, wallet, ".txt")
 }
 
@@ -898,10 +916,14 @@ fn validate_service(value: Option<String>) -> Result<Option<String>, DispatchRes
         .transpose()
 }
 
-pub fn bind(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
+pub fn bind(wallet: &str, index: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(safe_id, "safe id")) {
         return e;
     }
+    let index = match validate_index(index) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     if body.len() > 16 * 1024 {
         return invalid("binding request is too large");
     }
@@ -921,7 +943,7 @@ pub fn bind(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
     {
         return invalid("chain must be a configured Bloom chain name");
     }
-    let owner = match wallet_address(wallet) {
+    let owner = match wallet_address(wallet, index) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -930,7 +952,9 @@ pub fn bind(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
         Err(e) => return e,
     };
     if !safe.owners.iter().any(|v| v == &owner) {
-        return denied("Bloom wallet is not an owner of this Safe");
+        return denied(format!(
+            "account {index} of this wallet ({owner}) is not an owner of this Safe"
+        ));
     }
     let transaction_service = match validate_service(request.transaction_service) {
         Ok(v) => v,
@@ -962,7 +986,10 @@ fn unbind(wallet: &str, safe_id: &str) -> DispatchResponse {
 /// Forget a transaction and any signature held for it. This does not revoke
 /// a signature that was already published or shared: only executing another
 /// transaction at the same nonce does that.
-pub fn discard(wallet: &str, id: &str) -> DispatchResponse {
+pub fn discard(wallet: &str, index: &str, id: &str) -> DispatchResponse {
+    if let Err(e) = validate_index(index) {
+        return e;
+    }
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
     {
         return e;
@@ -978,7 +1005,7 @@ pub fn discard(wallet: &str, id: &str) -> DispatchResponse {
         let current = reconcile_execution(&mut state).unwrap_or(false);
         if !current || !(state.phase == "executed" || attempt_ended(&state.phase)) {
             return denied(
-                "an execution is staged in the executor's outbox and can still happen; it can be discarded once it has executed, failed or been cancelled",
+                "an execution is staged in this account's outbox and can still happen; it can be discarded once it has executed, failed or been cancelled",
             );
         }
     }
@@ -988,7 +1015,10 @@ pub fn discard(wallet: &str, id: &str) -> DispatchResponse {
     }
 }
 
-pub fn read_binding(wallet: &str, safe_id: &str) -> DispatchResponse {
+pub fn read_binding(wallet: &str, index: &str, safe_id: &str) -> DispatchResponse {
+    if let Err(e) = validate_index(index) {
+        return e;
+    }
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(safe_id, "safe id")) {
         return e;
     }
@@ -1009,7 +1039,7 @@ pub fn read_binding(wallet: &str, safe_id: &str) -> DispatchResponse {
         unreadable: Vec::new(),
     });
     // `null` when the listing failed: unknown, not absent.
-    let service_key_configured = service_key_safes(wallet)
+    let service_key_configured = list_records(SERVICE_KEY_PREFIX, wallet, ".txt")
         .ok()
         .map(|safes| safes.iter().any(|v| v == safe_id));
     petal::read_json_value(&json!({
@@ -1483,6 +1513,7 @@ pub fn signing_preimage(
 
 pub fn create_transaction(
     wallet: &str,
+    index: &str,
     safe_id: &str,
     id: &str,
     nonce: Option<&str>,
@@ -1491,6 +1522,7 @@ pub fn create_transaction(
     if let Err(e) = safe_segment(wallet, "wallet")
         .and_then(|_| safe_segment(safe_id, "safe id"))
         .and_then(|_| safe_segment(id, "transaction id"))
+        .and_then(|_| validate_index(index).map(|_| ()))
     {
         return e;
     }
@@ -1530,7 +1562,6 @@ pub fn create_transaction(
         outbox_id: None,
         execution_tx_hash: None,
         execution_status: None,
-        executor_wallet: None,
         library_code_hash,
         execution_chain: None,
     };
@@ -1636,8 +1667,10 @@ fn normalize_signature(mut value: Vec<u8>) -> Result<String, DispatchResponse> {
     Ok(format!("0x{}", hex::encode(value)))
 }
 
-pub fn confirm(ctx: &petal::Ctx, wallet: &str, id: &str) -> DispatchResponse {
-    if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
+pub fn confirm(ctx: &petal::Ctx, wallet: &str, index: &str, id: &str) -> DispatchResponse {
+    if let Err(e) = safe_segment(wallet, "wallet")
+        .and_then(|_| safe_segment(id, "transaction id"))
+        .and_then(|_| validate_index(index).map(|_| ()))
     {
         return e;
     }
@@ -2069,8 +2102,10 @@ fn ordered_signatures(
     Ok(signatures.into_values().take(threshold).flatten().collect())
 }
 
-pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
-    if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
+pub fn execute(wallet: &str, index: &str, id: &str, body: &[u8]) -> DispatchResponse {
+    if let Err(e) = safe_segment(wallet, "wallet")
+        .and_then(|_| safe_segment(id, "transaction id"))
+        .and_then(|_| validate_index(index).map(|_| ()))
     {
         return e;
     }
@@ -2092,9 +2127,6 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     let _ = reconcile_execution(&mut state);
     if state.outbox_id.is_some() && !attempt_ended(&state.phase) {
         return DispatchResponse::Write;
-    }
-    if let Err(e) = safe_segment(&request.executor_wallet, "executor_wallet") {
-        return e;
     }
     let binding: Binding = match load(&binding_key(wallet, &state.safe_id), "Safe binding") {
         Ok(v) => v,
@@ -2178,7 +2210,7 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     }
     .abi_encode();
     let staged = match petal::sdk::tx_stage(&petal::EvmTransaction {
-        wallet: request.executor_wallet.clone(),
+        wallet: wallet.into(),
         chain: binding.chain.clone(),
         to: binding.safe.safe_address.clone(),
         value_wei: "0".into(),
@@ -2191,7 +2223,6 @@ pub fn execute(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
         Err(e) => return sdk_error(e),
     };
     state.outbox_id = Some(staged.outbox_id);
-    state.executor_wallet = Some(request.executor_wallet);
     state.phase = "execution_staged".into();
     state.execution_status = Some("staged".into());
     state.execution_tx_hash = None;
@@ -2232,8 +2263,7 @@ fn reconcile_execution(state: &mut TransactionState) -> Result<bool, DispatchRes
         Some(chain) => chain,
         None => load::<Binding>(&binding_key(&state.wallet, &state.safe_id), "Safe binding")?.chain,
     };
-    let executor = state.executor_wallet.as_deref().unwrap_or(&state.wallet);
-    let Ok(inspection) = petal::sdk::tx_inspect(executor, &chain, &outbox) else {
+    let Ok(inspection) = petal::sdk::tx_inspect(&state.wallet, &chain, &outbox) else {
         return Ok(false);
     };
     state.execution_status = Some(inspection.state.clone());
@@ -2247,7 +2277,10 @@ fn reconcile_execution(state: &mut TransactionState) -> Result<bool, DispatchRes
     Ok(true)
 }
 
-pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
+pub fn read_transaction(wallet: &str, index: &str, id: &str) -> DispatchResponse {
+    if let Err(e) = validate_index(index) {
+        return e;
+    }
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
     {
         return e;
@@ -2281,7 +2314,7 @@ pub fn read_transaction(wallet: &str, id: &str) -> DispatchResponse {
         "schema":state.schema,"wallet":state.wallet,"safe_id":state.safe_id,"id":state.id,"request":state.request,
         "safe_tx":state.safe_tx,"safe_tx_hash":state.safe_tx_hash,"phase":state.phase,
         "approval_action_id":state.approval_action_id,"service_status":state.service_status,"outbox_id":state.outbox_id,
-        "execution_tx_hash":state.execution_tx_hash,"execution_status":state.execution_status,"executor_wallet":state.executor_wallet,
+        "execution_tx_hash":state.execution_tx_hash,"execution_status":state.execution_status,
         "current_safe_nonce":current_nonce,"nonce_conflict":nonce_conflict
     });
     petal::read_json_value(&view)
@@ -2312,7 +2345,7 @@ fn queue_and_history(wallet: &str, safe_id: &str) -> Result<QueueProjection, Dis
     let mut pending = Vec::new();
     let mut history = Vec::new();
     let mut unreadable = Vec::new();
-    let ids = transaction_ids(wallet)?;
+    let ids = list_records(TRANSACTION_PREFIX, wallet, ".json")?;
     let truncated = ids.len() >= MAX_LISTED;
     for id in ids {
         let Ok(state) = load::<TransactionState>(&tx_key(wallet, &id), "Safe transaction") else {
@@ -2507,9 +2540,9 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
     out.push_str(match state.phase.as_str() {
         "draft" => "Write `confirm.json` to ask Bloom for this wallet's owner signature. That opens an approval ceremony showing Broker's own reconstruction of the transaction.\n",
         "approval_required" => "An approval ceremony is open. Complete it, then write `confirm.json` again to collect the signature.\n",
-        "signed" => "Write `execute.json` with an executor wallet to stage the outer transaction. The executor pays gas and is a separate approval from the owner signature. A transaction queued at a later nonce executes only once the Safe reaches that nonce.\n",
+        "signed" => "Write `execute.json` to stage the outer transaction. This account pays gas and is a separate approval from the owner signature. A transaction queued at a later nonce executes only once the Safe reaches that nonce.\n",
         "proposed" => "The transaction is published to the Transaction Service. Collect the remaining confirmations, then write `execute.json`.\n",
-        "execution_staged" => "The outer transaction is staged in Bloom's EVM outbox. Approve it as the executor wallet, then read `status.json` until it reaches `executed`, `execution_failed` or `execution_cancelled`.\n",
+        "execution_staged" => "The outer transaction is staged in Bloom's EVM outbox. Approve it as this account, then read `status.json` until it reaches `executed`, `execution_failed` or `execution_cancelled`.\n",
         "executed" => "Done. `status.json` carries both the Safe transaction hash and the outer transaction hash.\n",
         "execution_failed" => "The outer transaction did not execute. If the Safe nonce is unchanged, write `execute.json` again to stage a new attempt; Bloom refuses it once anything else has spent the nonce.\n",
         "execution_cancelled" => "The outer transaction was cancelled before it was broadcast. If the Safe nonce is unchanged, write `execute.json` again to stage a new attempt.\n",
@@ -2523,7 +2556,10 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
     out
 }
 
-pub fn read_plan(wallet: &str, id: &str) -> DispatchResponse {
+pub fn read_plan(wallet: &str, index: &str, id: &str) -> DispatchResponse {
+    if let Err(e) = validate_index(index) {
+        return e;
+    }
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(id, "transaction id"))
     {
         return e;
@@ -2593,7 +2629,6 @@ pub struct DeploymentRequest {
     pub threshold: String,
     #[serde(default = "zero_string")]
     pub salt_nonce: String,
-    pub executor_wallet: String,
     #[serde(default)]
     pub nonce: Option<u64>,
     #[serde(default)]
@@ -2618,7 +2653,6 @@ pub struct DeploymentState {
     pub singleton: String,
     pub fallback_handler: String,
     pub safe_address: String,
-    pub executor_wallet: String,
     pub outbox_id: String,
     pub phase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2698,25 +2732,30 @@ fn verified_code(chain: &str, contract: &Library, label: &str) -> Result<(), Dis
     Ok(())
 }
 
-/// Stage the creation of a new Safe. The executor wallet pays for it and
+/// Stage the creation of a new Safe. The mounted account pays for it and
 /// approves it like any other transaction from Bloom's outbox; once it is
 /// mined, bind the Safe at the address this recorded.
-pub fn deploy(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
-    match stage_deployment(wallet, safe_id, body) {
+pub fn deploy(wallet: &str, index: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
+    match stage_deployment(wallet, index, safe_id, body) {
         Ok(()) => DispatchResponse::Write,
         Err(e) => e,
     }
 }
 
-fn stage_deployment(wallet: &str, safe_id: &str, body: &[u8]) -> Result<(), DispatchResponse> {
+fn stage_deployment(
+    wallet: &str,
+    index: &str,
+    safe_id: &str,
+    body: &[u8],
+) -> Result<(), DispatchResponse> {
     safe_segment(wallet, "wallet")?;
     safe_segment(safe_id, "safe id")?;
+    let index = validate_index(index)?;
     if body.len() > 16 * 1024 {
         return Err(invalid("deployment request is too large"));
     }
     let request: DeploymentRequest = serde_json::from_slice(body)
         .map_err(|e| invalid(format!("invalid deployment JSON: {e}")))?;
-    safe_segment(&request.executor_wallet, "executor_wallet")?;
     if request.chain.is_empty()
         || request.chain.len() > 64
         || !petal::is_safe_segment(&request.chain)
@@ -2735,9 +2774,11 @@ fn stage_deployment(wallet: &str, safe_id: &str, body: &[u8]) -> Result<(), Disp
         .find(|entry| entry.version == request.version)
         .ok_or_else(|| invalid("new Safes can be created as version 1.4.1 or 1.5.0"))?;
     let (owners, threshold) = deployment_owners(&request.owners, &request.threshold)?;
-    let owner = wallet_address(wallet)?;
+    let owner = wallet_address(wallet, index)?;
     if !owners.iter().any(|v| format!("{v:#x}") == owner) {
-        return Err(denied("the Bloom wallet must be one of the owners"));
+        return Err(denied(format!(
+            "account {index} of this wallet ({owner}) must be one of the owners"
+        )));
     }
     let salt_nonce = uint(&request.salt_nonce, "salt_nonce")?;
     let chain_id = chain_result(&request.chain, "eth_chainId", json!([]))?;
@@ -2782,7 +2823,7 @@ fn stage_deployment(wallet: &str, safe_id: &str, body: &[u8]) -> Result<(), Disp
     let predicted = createProxyWithNonceCall::abi_decode_returns(&predicted)
         .map_err(|e| backend(format!("decode predicted Safe address: {e}")))?;
     let staged = petal::sdk::tx_stage(&petal::EvmTransaction {
-        wallet: request.executor_wallet.clone(),
+        wallet: wallet.into(),
         chain: request.chain.clone(),
         to: contracts.factory.address.into(),
         value_wei: "0".into(),
@@ -2808,7 +2849,6 @@ fn stage_deployment(wallet: &str, safe_id: &str, body: &[u8]) -> Result<(), Disp
             singleton: singleton.into(),
             fallback_handler: contracts.fallback_handler.address.into(),
             safe_address: format!("{predicted:#x}"),
-            executor_wallet: request.executor_wallet,
             outbox_id: staged.outbox_id,
             phase: "deployment_staged".into(),
             deployment_status: Some("staged".into()),
@@ -2826,7 +2866,10 @@ fn deployment_phase(state: &DeploymentState) -> String {
     }
 }
 
-pub fn read_deployment(wallet: &str, safe_id: &str) -> DispatchResponse {
+pub fn read_deployment(wallet: &str, index: &str, safe_id: &str) -> DispatchResponse {
+    if let Err(e) = validate_index(index) {
+        return e;
+    }
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(safe_id, "safe id")) {
         return e;
     }
@@ -2834,9 +2877,7 @@ pub fn read_deployment(wallet: &str, safe_id: &str) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if let Ok(inspection) =
-        petal::sdk::tx_inspect(&state.executor_wallet, &state.chain, &state.outbox_id)
-    {
+    if let Ok(inspection) = petal::sdk::tx_inspect(&state.wallet, &state.chain, &state.outbox_id) {
         state.deployment_status = Some(inspection.state);
         state.deployment_tx_hash = inspection.tx_hash;
         state.phase = deployment_phase(&state);
@@ -2866,14 +2907,17 @@ pub fn read_deployment(wallet: &str, safe_id: &str) -> DispatchResponse {
         }
         (_, "deployment_staged") => format!(
             "Approve outbox entry {} as wallet {}, then read this file again.",
-            state.outbox_id, state.executor_wallet
+            state.outbox_id, state.wallet
         ),
         _ => "The deployment did not happen. Write this file again to stage a new attempt.".into(),
     };
     petal::read_json_value(&json!({"deployment": state, "deployed": deployed, "next": next}))
 }
 
-pub fn set_service_key(wallet: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
+pub fn set_service_key(wallet: &str, index: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
+    if let Err(e) = validate_index(index) {
+        return e;
+    }
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(safe_id, "safe id")) {
         return e;
     }
@@ -2972,7 +3016,6 @@ mod tests {
             outbox_id: None,
             execution_tx_hash: None,
             execution_status: None,
-            executor_wallet: None,
             library_code_hash: None,
             execution_chain: None,
         }
@@ -2996,6 +3039,22 @@ mod tests {
         );
         // A deeper key than this Petal writes yields no third segment.
         assert_eq!(key_segment(&key, BINDING_PREFIX, 2), None);
+    }
+
+    #[test]
+    fn an_index_is_an_account_number_in_exactly_one_spelling() {
+        assert_eq!(validate_index("0").ok(), Some(0));
+        assert_eq!(validate_index("7").ok(), Some(7));
+        assert_eq!(validate_index("2147483647").ok(), Some(2_147_483_647));
+        // Each of these would otherwise reach account 1's address path and
+        // store records under a second name for the same account.
+        for spelling in ["01", "+1", " 1", "1 ", "1.0", "0x1", ""] {
+            assert!(validate_index(spelling).is_err(), "accepted {spelling:?}");
+        }
+        // Bloom's account numbers stop below the hardened-derivation bit, so a
+        // u32 that parses is still not an account.
+        assert!(validate_index("2147483648").is_err());
+        assert!(validate_index("4294967296").is_err());
     }
 
     #[test]
@@ -3215,7 +3274,6 @@ mod tests {
             outbox_id: None,
             execution_tx_hash: None,
             execution_status: None,
-            executor_wallet: None,
             library_code_hash: None,
             execution_chain: None,
         };
@@ -3648,7 +3706,6 @@ mod tests {
             outbox_id: None,
             execution_tx_hash: None,
             execution_status: None,
-            executor_wallet: None,
             library_code_hash: None,
             execution_chain: None,
         };

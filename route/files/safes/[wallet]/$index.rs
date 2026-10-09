@@ -1,10 +1,3 @@
-petal::route_file!(
-    spec: petal::store_dir_spec().caps(&["bloom:store"]),
-    ctx_list: |ctx: &petal::Ctx| {
-        let wallet = petal::param(ctx, "wallet")?;
-        Ok(crate::bound_safes(wallet)?
-            .into_iter()
-            .map(|safe_id| petal::writable(format!("{safe_id}.json")))
-            .collect())
-    }
-);
+// Bloom supplies the live wallet and account directory inventory from its
+// own authenticated projection; this Petal does not enumerate accounts itself.
+petal::route_file!(spec: petal::static_dir_spec(), list: Vec::new());
