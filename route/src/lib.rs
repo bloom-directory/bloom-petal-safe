@@ -595,12 +595,16 @@ fn validate_index(index: &str) -> Result<u32, DispatchResponse> {
 /// the signing key from the same account, so reading any other one would check
 /// ownership against an address that will not sign.
 fn wallet_address(wallet: &str, index: u32) -> Result<String, DispatchResponse> {
-    let bytes = petal::sdk::vfs_read(&format!("wallets/{wallet}/{index}/address.evm"), 128)
-        .map_err(sdk_error)?;
+    let bytes =
+        petal::sdk::vfs_read(&wallet_address_path(wallet, index), 128).map_err(sdk_error)?;
     let value = std::str::from_utf8(&bytes)
         .map_err(|_| backend("wallet address is not UTF-8"))?
         .trim();
     normalized_address(value, "wallet address")
+}
+
+fn wallet_address_path(wallet: &str, index: u32) -> String {
+    format!("wallets/{wallet}/{index}/address.evm")
 }
 
 fn binding_key(wallet: &str, safe_id: &str) -> String {
@@ -2867,9 +2871,10 @@ fn deployment_phase(state: &DeploymentState) -> String {
 }
 
 pub fn read_deployment(wallet: &str, index: &str, safe_id: &str) -> DispatchResponse {
-    if let Err(e) = validate_index(index) {
-        return e;
-    }
+    let index = match validate_index(index) {
+        Ok(index) => index,
+        Err(e) => return e,
+    };
     if let Err(e) = safe_segment(wallet, "wallet").and_then(|_| safe_segment(safe_id, "safe id")) {
         return e;
     }
@@ -2896,9 +2901,14 @@ pub fn read_deployment(wallet: &str, index: &str, safe_id: &str) -> DispatchResp
         state.phase = "deployed".into();
         let _ = save(&deployment_key(wallet, safe_id), &state);
     }
-    let next = match (deployed, state.phase.as_str()) {
+    let next = deployment_next(&state, index, deployed);
+    petal::read_json_value(&json!({"deployment": state, "deployed": deployed, "next": next}))
+}
+
+fn deployment_next(state: &DeploymentState, index: u32, deployed: Option<bool>) -> String {
+    match (deployed, state.phase.as_str()) {
         (Some(true), _) => format!(
-            "The Safe exists. Bind it by writing {{\"chain\":\"{}\",\"safe_address\":\"{}\"}} to safes/{}/{}.json.",
+            "The Safe exists. Bind it by writing {{\"chain\":\"{}\",\"safe_address\":\"{}\"}} to safes/{}/{index}/{}.json.",
             state.chain, state.safe_address, state.wallet, state.safe_id
         ),
         (_, "deployed") => {
@@ -2906,12 +2916,11 @@ pub fn read_deployment(wallet: &str, index: &str, safe_id: &str) -> DispatchResp
                 .into()
         }
         (_, "deployment_staged") => format!(
-            "Approve outbox entry {} as wallet {}, then read this file again.",
-            state.outbox_id, state.wallet
+            "Approve outbox entry {} by writing confirm to wallets/{}/{index}/chains/{}/outbox/pending/{}/confirm, then read this file again.",
+            state.outbox_id, state.wallet, state.chain, state.outbox_id
         ),
         _ => "The deployment did not happen. Write this file again to stage a new attempt.".into(),
-    };
-    petal::read_json_value(&json!({"deployment": state, "deployed": deployed, "next": next}))
+    }
 }
 
 pub fn set_service_key(wallet: &str, index: &str, safe_id: &str, body: &[u8]) -> DispatchResponse {
@@ -3019,6 +3028,47 @@ mod tests {
             library_code_hash: None,
             execution_chain: None,
         }
+    }
+
+    #[test]
+    fn ownership_reads_the_mounted_account_address() {
+        assert_eq!(
+            wallet_address_path("owner", 0),
+            "wallets/owner/0/address.evm"
+        );
+        assert_eq!(
+            wallet_address_path("owner", 3),
+            "wallets/owner/3/address.evm"
+        );
+    }
+
+    #[test]
+    fn deployment_next_names_the_account_routes() {
+        let mut state = DeploymentState {
+            schema: "bloom.safe.deployment.v1".into(),
+            wallet: "owner".into(),
+            safe_id: "treasury".into(),
+            chain: "ethereum".into(),
+            chain_id: "1".into(),
+            safe_version: "1.4.1".into(),
+            owners: vec![],
+            threshold: "1".into(),
+            salt_nonce: "0".into(),
+            factory: ZERO.into(),
+            singleton: ZERO.into(),
+            fallback_handler: ZERO.into(),
+            safe_address: "0x1000000000000000000000000000000000000000".into(),
+            outbox_id: "0001-abc".into(),
+            phase: "deployment_staged".into(),
+            deployment_status: None,
+            deployment_tx_hash: None,
+        };
+        assert!(
+            deployment_next(&state, 2, Some(false))
+                .contains("wallets/owner/2/chains/ethereum/outbox/pending/0001-abc/confirm")
+        );
+        state.phase = "deployed".into();
+        assert!(deployment_next(&state, 2, Some(true)).contains("to safes/owner/2/treasury.json."));
     }
 
     #[test]

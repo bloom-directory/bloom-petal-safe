@@ -31,7 +31,7 @@ Write this JSON to `petals/safe/deployments/<wallet>/<index>/<safe-id>.json`:
 
 `version` is `1.4.1` (the default) or `1.5.0`. The Bloom wallet must be one of the owners. The new Safe has the official fallback handler and nothing else: no module, no guard, no setup call, no payment. Away from Ethereum mainnet it uses Safe's L2 singleton.
 
-The Petal stages a call to the official proxy factory in this account's outbox, so its policy must allow the factory as a destination. Broker shows that call as a contract call it cannot explain; the owners and threshold are in this file and are verified from the chain when the Safe is bound. Approve the outbox entry, read the file until `deployed` is true, then bind the address it names. The address depends on the owners, threshold and `salt_nonce`.
+The Petal stages a call to the official proxy factory in this account's outbox, so its policy must allow the factory as a destination. Broker shows that call as a contract call it cannot explain; the owners and threshold are in this file and are verified from the chain when the Safe is bound. Approve the outbox entry by writing `confirm` to `wallets/<wallet>/<index>/chains/<chain>/outbox/pending/<outbox_id>/confirm` (the file names `outbox_id`), read the file until `deployed` is true, then bind the address it names. The address depends on the owners, threshold and `salt_nonce`.
 
 ## Bind a Safe
 
@@ -63,26 +63,27 @@ The value is stored in the Petal's secret namespace. It cannot be read through V
 
 ## Find what is already there
 
-Every directory lists what it holds, so nothing has to be remembered outside
-Bloom:
+Bloom keeps this Petal's records per account, and each account directory lists
+what that account holds:
 
 ```text
-petals/safe/safes/                            wallets holding a binding
 petals/safe/safes/<wallet>/<index>/           <safe-id>.json per bound Safe
-petals/safe/transactions/                     wallets holding a transaction
 petals/safe/transactions/<wallet>/<index>/    one directory per transaction id
 petals/safe/service-keys/<wallet>/<index>/    Safes that have a service key set
 petals/safe/deployments/<wallet>/<index>/     <safe-id>.json per Safe created here
 ```
 
-A listing shows at most 1,024 names. The service-key listing projects record
-names only. The stored key is never read back, there or anywhere else. Bloom
-lists a wallet's accounts itself, so `<wallet>/` is not enumerated here.
+The top-level directories (`petals/safe/safes/` and the others) do not list
+wallets, and Bloom does not enumerate `<wallet>/` here; list `wallets/` and the
+wallet's accounts in Bloom. A listing shows at most 1,024 names. The
+service-key listing projects record names only. The stored key is never read
+back, there or anywhere else.
 
 Reading `safes/<wallet>/<index>/<safe-id>.json` also returns `queue` and `history` for
-that Safe: every transaction this wallet drafted against it, ordered by Safe
-nonce, so two drafts competing for the same nonce are visible before either is
-signed. `history_complete` is false when the wallet holds more transactions
+that Safe: every transaction this account drafted against it, ordered by Safe
+nonce, so two of its drafts competing for the same nonce are visible before
+either is signed. Drafts by another account, including another account of the
+same wallet that co-owns the Safe, are not shown. `history_complete` is false when the account holds more transactions
 than a listing returns or a record could not be read; `unreadable_transactions`
 names the skipped records. `service_key_configured` is `null` when it could not
 be determined.
@@ -142,7 +143,7 @@ Write to `.../<transaction-id>/execute.json`:
 
 When a Transaction Service is configured, confirmations are fetched automatically and added to any in `signatures`. If the service is unreachable or does not hold the transaction, execution proceeds when the signatures already in hand meet the threshold. Without a service, add 65-byte EOA owner signatures to `signatures`. Every signature is recovered against `safeTxHash`, checked against current owners, deduplicated, sorted by owner address, and threshold checked. An owner that has approved the hash on chain with `approveHash` counts too, which is how an owner that is itself a contract takes part; the Petal reads those approvals from the Safe when the signatures fall short. Contract (EIP-1271) signatures are not supported.
 
-The encoded `execTransaction` is staged in Bloom's native EVM outbox and requires the normal sender approval. Bloom stages it from the account the route is mounted under; confirm that outbox entry as that account (`bloom wallet confirm <wallet> <chain> <outbox_id>`, with `outbox_id` from `status.json`), then read `.../<transaction-id>/status.json` until its `phase` is `executed`, `execution_failed` or `execution_cancelled`.
+The encoded `execTransaction` is staged in Bloom's native EVM outbox and requires the normal sender approval. Bloom stages it from the account the route is mounted under; confirm that outbox entry by writing `confirm` to `wallets/<wallet>/<index>/chains/<chain>/outbox/pending/<outbox_id>/confirm`, with `outbox_id` from `status.json`. `bloom wallet confirm` only reaches account 0. Then read `.../<transaction-id>/status.json` until its `phase` is `executed`, `execution_failed` or `execution_cancelled`.
 
 If the outer transaction reverts or fails, the phase is `execution_failed`; if the outbox entry is cancelled before broadcast, it is `execution_cancelled`. In either case write `execute.json` again to stage a new attempt; Bloom refuses it once the Safe nonce has moved.
 
@@ -175,6 +176,7 @@ A build from before the routes carried `<index>` kept its records under the wall
 - All Safe gas reimbursement fields are zero.
 - Safe self-administration other than owner and threshold changes (modules, guards, fallback handler), arbitrary delegatecalls, modules as authorization, and EIP-7702 accounts are rejected.
 - A configured guard or module is surfaced in every review; guards can still reject execution, and modules may execute transactions outside this Petal.
+- A wallet with clear signing enabled cannot create or execute a Safe through this Petal: Bloom sends Petal transactions without a review mode, and Broker refuses the factory and `execTransaction` calls as calls its catalog cannot describe.
 
 ## Development
 
