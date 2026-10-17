@@ -13,7 +13,9 @@ bloom petals install https://github.com/bloom-directory/bloom-petal-safe
 bloom petals ls
 ```
 
-The wallet policy must allow the Petal package and carry `{"chain": "evm-<chain id>", "destination": "exact"}` (Broker keys Safe signing by chain id, for example `evm-1` for Ethereum mainnet). It must also allow the Safe address as a destination on the chain's configured Bloom name, for example `{"chain": "ethereum", "destination": "0x<safe>"}`, because the outer `execTransaction` goes through Bloom's native outbox; if it does not, the first confirm opens a policy-update ceremony that adds it. To use a self-hosted Transaction Service, configure the Petal endpoint binding `transaction-service` to its HTTPS origin and store the same origin in the binding; it must serve `/api/v1/` at the root.
+The wallet policy must allow the Petal package and carry `{"chain": "evm-<chain id>", "destination": "exact"}` (Broker keys Safe signing by chain id, for example `evm-1` for Ethereum mainnet). It must also allow the Safe address as a destination on the chain's configured Bloom name, for example `{"chain": "ethereum", "destination": "0x<safe>"}`, because the outer `execTransaction` goes through Bloom's native outbox. Add that destination through the normal wallet policy-update flow before staging execution. A missing destination causes a policy refusal; confirming the execution does not automatically open a policy-update ceremony.
+
+To use a self-hosted Transaction Service, configure the Petal endpoint binding `transaction-service` to its HTTPS origin and store the same origin in the binding; it must serve `/api/v1/` at the root.
 
 ## Create a Safe
 
@@ -31,7 +33,7 @@ Write this JSON to `petals/safe/deployments/<wallet>/<index>/<safe-id>.json`:
 
 `version` is `1.4.1` (the default) or `1.5.0`. The Bloom wallet must be one of the owners. The new Safe has the official fallback handler and nothing else: no module, no guard, no setup call, no payment. Away from Ethereum mainnet it uses Safe's L2 singleton.
 
-The Petal stages a call to the official proxy factory in this account's outbox, so its policy must allow the factory as a destination. Broker shows that call as a contract call it cannot explain; the owners and threshold are in this file and are verified from the chain when the Safe is bound. Approve the outbox entry by writing `confirm` to `wallets/<wallet>/<index>/chains/<chain>/outbox/pending/<outbox_id>/confirm` (the file names `outbox_id`), read the file until `deployed` is true, then bind the address it names. The address depends on the owners, threshold and `salt_nonce`.
+The Petal stages a call to the official proxy factory in this account's outbox, so its policy must allow the factory as a destination. Broker's built-in catalog (bloom-broker#103) reads the official factory call; the owners and threshold are also in this file and are verified from the chain when the Safe is bound. Approve the outbox entry by writing `confirm` to `wallets/<wallet>/<index>/chains/<chain>/outbox/pending/<outbox_id>/confirm` (the file names `outbox_id`), read the file until `deployed` is true, then bind the address it names. The address depends on the owners, threshold and `salt_nonce`.
 
 ## Bind a Safe
 
@@ -146,6 +148,8 @@ When a Transaction Service is configured, confirmations are fetched automaticall
 The encoded `execTransaction` is staged in Bloom's native EVM outbox and requires the normal sender approval. Bloom stages it from the account the route is mounted under; confirm that outbox entry by writing `confirm` to `wallets/<wallet>/<index>/chains/<chain>/outbox/pending/<outbox_id>/confirm`, with `outbox_id` from `status.json`. `bloom wallet confirm` only reaches account 0. Then read `.../<transaction-id>/status.json` until its `phase` is `executed`, `execution_failed` or `execution_cancelled`.
 
 If the outer transaction reverts or fails, the phase is `execution_failed`; if the outbox entry is cancelled before broadcast, it is `execution_cancelled`. In either case write `execute.json` again to stage a new attempt; Bloom refuses it once the Safe nonce has moved.
+
+For a policy refusal, approve the required wallet policy change before retrying. Machine's recovery fix in bloom#224 persists the failed outbox status and recognizes older unbroadcast policy refusals, so `status.json` can report `execution_failed` instead of remaining `execution_staged`. A transaction with a known hash or broadcast marker remains subject to reconciliation; do not stage another execution merely because a status read is unavailable.
 
 `nonce_conflict` means the Safe nonce was consumed outside this Bloom execution: by another transaction, or by someone else executing this same one.
 
