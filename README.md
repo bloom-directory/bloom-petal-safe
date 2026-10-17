@@ -180,7 +180,7 @@ A build from before the routes carried `<index>` kept its records under the wall
 - All Safe gas reimbursement fields are zero.
 - Safe self-administration other than owner and threshold changes (modules, guards, fallback handler), arbitrary delegatecalls, modules as authorization, and EIP-7702 accounts are rejected.
 - A configured guard or module is surfaced in every review; guards can still reject execution, and modules may execute transactions outside this Petal.
-- A wallet with clear signing enabled cannot create or execute a Safe through this Petal: Bloom sends Petal transactions without a review mode, and Broker refuses the factory and `execTransaction` calls as calls its catalog cannot describe.
+- Broker reads Safe creation, execution, batches and deployments for every wallet (bloom-broker#103). Its review says Bloom has not verified that the Safe's address runs a Safe.
 
 ## Development
 
