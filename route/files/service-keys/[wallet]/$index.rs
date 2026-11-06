@@ -1,11 +1,3 @@
-// Names only: the stored key is write-only and is never read back here.
-petal::route_file!(
-    spec: petal::store_dir_spec().caps(&["bloom:store"]),
-    ctx_list: |ctx: &petal::Ctx| {
-        let wallet = petal::param(ctx, "wallet")?;
-        Ok(crate::service_key_safes(wallet)?
-            .into_iter()
-            .map(petal::writable)
-            .collect())
-    }
-);
+// Bloom supplies the live wallet and account directory inventory from its
+// own authenticated projection; this Petal does not enumerate accounts itself.
+petal::route_file!(spec: petal::static_dir_spec(), list: Vec::new());

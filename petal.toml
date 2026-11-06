@@ -10,7 +10,7 @@ command = "scripts/build.sh"
 outputs = ["petal/safe"]
 
 [consent]
-summary = "Inspect, sign, coordinate, and execute bounded Safe smart-account transactions with Bloom-held owner and executor keys."
+summary = "Inspect, sign, coordinate, and execute bounded Safe smart-account transactions with Bloom-held owner keys."
 
 [caps]
 allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:chain", "bloom:tx.outbox", "bloom:vfs.read"]
