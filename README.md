@@ -215,18 +215,4 @@ anvil --port 18545 --silent &
 npm run test:anvil
 ```
 
-`npm run test:triad-delegate` exercises the compiled Petal through a disposable local Machine–Broker–Signer stack and loopback Anvil. It requires sibling `bloom`, `bloom-broker` and `bloom-signer` checkouts, their developer-harness binaries, Node.js, Foundry, `jq` and `cloudflared`. Build the candidate binaries explicitly first:
-
-```sh
-(cd ../bloom && cargo build -p bloom --no-default-features --features mount,triad-dev-harness)
-(cd ../bloom-broker && cargo build -p bloom-broker -p bloom-broker-debug-driver --features bloom-broker/triad-dev-harness)
-(cd ../bloom-signer && cargo build -p bloom-signer --features triad-dev-harness)
-scripts/build.sh
-npm run test:triad-delegate
-```
-
-The test imports a public test mnemonic through Broker's ceremony, allocates account 1, approves the exact package policy, and verifies Broker's independent Safe review before actual Signer signing. It checks the proposal signature against the on-chain Safe hash, recovery after a lost service response, idempotent retries, private reads, confirmation/execution refusal, delegation revocation, rejection of the delegate signature by the real Safe contract, and execution of the same proposal by an actual owner.
-
-The Transaction Service is an authenticated fixture, not a full Safe service deployment. An ephemeral [Cloudflare quick tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/) exposes only that fixture to supply publicly trusted HTTPS; internet access is required. Anvil, Bloom and authority services stay local, and the fixture has no HTTP control endpoints. The test uses an exact-host loopback CONNECT proxy if the OS resolver cannot resolve a fresh tunnel name; TLS verification remains enabled. A software WebAuthn test authenticator completes real Broker ceremonies, so this does not establish browser or production-principal acceptance. Override the standard `BLOOM_INTEGRATION_*_BIN` variables to select other candidate binaries. Processes are stopped after the run; private disposable diagnostics and binary revision/hash evidence remain in the printed `/tmp/safe-e2e.*/evidence.json` location.
-
 Licensed under the MIT License. See [LICENSE](./LICENSE).
