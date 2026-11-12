@@ -2,7 +2,7 @@
 
 Create and operate Safe smart accounts with Bloom-backed owner signing and EVM execution. Private keys stay in Bloom; no deployment or signing key is placed in an environment variable.
 
-Every route is mounted under one wallet account: `<wallet>/<index>`, where `index` is the account number Bloom selected. That account is both the Safe owner the Petal signs as and the sender that pays for execution, and each account keeps its own bindings, transactions, deployments and service keys.
+Every route is mounted under one wallet account: `<wallet>/<index>`, where `index` is the account number Bloom selected. By default that account is both the Safe owner the Petal signs as and the sender that pays for execution. An explicit delegate binding uses a non-owner account to propose transactions only. Each account keeps its own bindings, transactions, deployments and service keys.
 
 The Petal supports Safe 1.3.0, 1.4.1, and 1.5.0, native transfers, arbitrary calls, ERC-20 transfers, call-only batches, Safe Transaction Builder imports, CREATE, CREATE2, rejection transactions, Safe Transaction Service proposal/confirmation, offline signature collection, on-chain hash approvals, queued nonces, owner and threshold changes, and outbox execution.
 
@@ -13,9 +13,9 @@ bloom petals install https://github.com/bloom-directory/bloom-petal-safe
 bloom petals ls
 ```
 
-The wallet policy must allow the Petal package and carry `{"chain": "evm-<chain id>", "destination": "exact"}` (Broker keys Safe signing by chain id, for example `evm-1` for Ethereum mainnet). It must also allow the Safe address as a destination on the chain's configured Bloom name, for example `{"chain": "ethereum", "destination": "0x<safe>"}`, because the outer `execTransaction` goes through Bloom's native outbox. Add that destination through the normal wallet policy-update flow before staging execution. A missing destination causes a policy refusal; confirming the execution does not automatically open a policy-update ceremony.
+The wallet policy must allow the Petal package and carry `{"chain": "evm-<chain id>", "destination": "exact"}` (Broker keys Safe signing by chain id, for example `evm-1` for Ethereum mainnet). For owner-mode execution, it must also allow the Safe address as a destination on the chain's configured Bloom name, for example `{"chain": "ethereum", "destination": "0x<safe>"}`, because the outer `execTransaction` goes through Bloom's native outbox. Add that destination through the normal wallet policy-update flow before staging execution. A missing destination causes a policy refusal; confirming the execution does not automatically open a policy-update ceremony. Delegate-only proposing needs the signing policy but no outbox destination or gas funding.
 
-To use a self-hosted Transaction Service, configure the Petal endpoint binding `transaction-service` to its HTTPS origin and store the same origin in the binding; it must serve `/api/v1/` at the root.
+To use a self-hosted Transaction Service, configure the Petal endpoint binding `transaction-service` to its HTTPS origin and store the same origin in the binding; it must serve `/api/v1/` at the root, plus `/api/v2/delegates/` for delegate mode.
 
 ## Create a Safe
 
@@ -53,7 +53,22 @@ Write this JSON to `petals/safe/safes/<wallet>/<index>/<safe-id>.json`:
 now redirect there, and Bloom does not follow redirects to an undeclared host,
 so bind the new base directly. Omit the field to collect signatures offline.
 
-Bloom verifies code at the address, chain ID, singleton, `VERSION()`, owners, threshold, nonce, guard, all enabled modules (up to 64), and fallback handler. The EVM address of the account the route is mounted under (`wallets/<wallet>/<index>/address.evm`) must be a current owner. Read the same path to compare the bound configuration with current chain state.
+Bloom verifies code at the address, chain ID, singleton, `VERSION()`, owners, threshold, nonce, guard, all enabled modules (up to 64), and fallback handler. The default `"mode":"owner"` requires the EVM address of the account the route is mounted under (`wallets/<wallet>/<index>/address.evm`) to be a current owner. Read the same path to compare the bound configuration with current chain state.
+
+For a [Safe proposer](https://help.safe.global/articles/1671337645-proposers), bind a separate non-owner Bloom account with an explicit delegate mode and a Transaction Service:
+
+```json
+{
+  "chain": "ethereum",
+  "safe_address": "0x...",
+  "mode": "delegate",
+  "transaction_service": "https://api.safe.global/tx-service/eth"
+}
+```
+
+An owner must have already registered this account as a [service delegate](https://docs.safe.global/core-api/transaction-service-guides/delegates). Bloom checks `/api/v2/delegates/` against the owners read from chain, accepting either a grant scoped to this Safe or a global grant (`safe: null`) from a current owner. Expired, revoked, foreign-Safe, or former-owner grants do not authorize proposing. Checks run at binding, drafting, signing and publication; service failures block delegate use. Pagination is bounded to 16 pages of 100 records and follows locally constructed offsets, never a returned URL. The Transaction Service is the authority for these off-chain grants; this is not on-chain spending permission.
+
+Delegate mode rejects an account that is also a Safe owner. Changing a binding's mode requires a new draft; an existing draft retains its original mode.
 
 Hosted Safe Transaction Service API keys are optional and write-only:
 
@@ -61,7 +76,7 @@ Hosted Safe Transaction Service API keys are optional and write-only:
 petals/safe/service-keys/<wallet>/<index>/<safe-id>
 ```
 
-The value is stored in the Petal's secret namespace. It cannot be read through VFS.
+The value is stored in the Petal's secret namespace. It cannot be read through VFS. If the service requires authentication for delegate lookups, set the key at this path before binding the Safe.
 
 ## Find what is already there
 
@@ -131,6 +146,12 @@ Write an empty body to `.../<transaction-id>/confirm.json`. Bloom displays Broke
 
 If the binding has a Transaction Service, the Petal proposes a new transaction or adds its confirmation to an existing exact transaction. Service responses are checked against every Safe transaction field and hash. Without a service, the signature remains in Petal-private state for direct execution.
 
+For a delegate draft, read `plan.md`, then write an empty body to `.../<transaction-id>/propose.json` instead. Complete Broker's approval ceremony and retry the write to collect the signature and publish. This signature authenticates the service proposal and contributes **zero** owner confirmations. It is held privately, separately from owner signatures, and is never returned by a route read. A retry finding an existing exact proposal succeeds without posting to the owner confirmations endpoint. `confirm.json` and `execute.json` are refused for delegate drafts; owners must confirm and execute using their own account or Safe Wallet.
+
+Delegate proposal signing retains the existing `safe.transaction.confirm` operation and `bloom.safe.review.v1` envelope so Broker still independently reconstructs and reviews the exact transaction. The legacy envelope's `owner` field identifies the Bloom signer, including a delegate. Current Broker ceremony details label that account `Signing owner` / `Signing owner · EOA`; those labels do not establish membership or make a delegate signature count toward the threshold. The Petal verifies the signer's actual role against current chain state. No Broker upgrade is required.
+
+`status.json` exposes the draft's `mode`, proposal publication state and live Safe nonce. When someone else consumes the nonce it reports `nonce_conflict`; it does not prove which external transaction executed or fetch external owner confirmations. Use Safe Wallet for that confirmation and execution history. Neither `status.json` nor `plan.md` includes the proposal signature.
+
 ## Execute
 
 Write to `.../<transaction-id>/execute.json`:
@@ -177,6 +198,7 @@ A build from before the routes carried `<index>` kept its records under the wall
 
 - A transaction can be signed for the current Safe nonce or up to 64 past it. A signature for a queued nonce stays valid until that nonce is spent.
 - Safe configuration drift blocks signing and execution until the Safe is rebound.
+- Keep a proposer account outside the owner set while its signed proposals remain outstanding. A Safe transaction signature can become owner authorization if that same account is later added as an owner before the nonce is spent. Revoking a service delegation or discarding a draft cannot revoke a published signature.
 - All Safe gas reimbursement fields are zero.
 - Safe self-administration other than owner and threshold changes (modules, guards, fallback handler), arbitrary delegatecalls, modules as authorization, and EIP-7702 accounts are rejected.
 - A configured guard or module is surfaced in every review; guards can still reject execution, and modules may execute transactions outside this Petal.
@@ -192,5 +214,19 @@ forge build
 anvil --port 18545 --silent &
 npm run test:anvil
 ```
+
+`npm run test:triad-delegate` exercises the compiled Petal through a disposable local Machine–Broker–Signer stack and loopback Anvil. It requires sibling `bloom`, `bloom-broker` and `bloom-signer` checkouts, their developer-harness binaries, Node.js, Foundry, `jq` and `cloudflared`. Build the candidate binaries explicitly first:
+
+```sh
+(cd ../bloom && cargo build -p bloom --no-default-features --features mount,triad-dev-harness)
+(cd ../bloom-broker && cargo build -p bloom-broker -p bloom-broker-debug-driver --features bloom-broker/triad-dev-harness)
+(cd ../bloom-signer && cargo build -p bloom-signer --features triad-dev-harness)
+scripts/build.sh
+npm run test:triad-delegate
+```
+
+The test imports a public test mnemonic through Broker's ceremony, allocates account 1, approves the exact package policy, and verifies Broker's independent Safe review before actual Signer signing. It checks the proposal signature against the on-chain Safe hash, recovery after a lost service response, idempotent retries, private reads, confirmation/execution refusal, delegation revocation, rejection of the delegate signature by the real Safe contract, and execution of the same proposal by an actual owner.
+
+The Transaction Service is an authenticated fixture, not a full Safe service deployment. An ephemeral [Cloudflare quick tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/) exposes only that fixture to supply publicly trusted HTTPS; internet access is required. Anvil, Bloom and authority services stay local, and the fixture has no HTTP control endpoints. The test uses an exact-host loopback CONNECT proxy if the OS resolver cannot resolve a fresh tunnel name; TLS verification remains enabled. A software WebAuthn test authenticator completes real Broker ceremonies, so this does not establish browser or production-principal acceptance. Override the standard `BLOOM_INTEGRATION_*_BIN` variables to select other candidate binaries. Processes are stopped after the run; private disposable diagnostics and binary revision/hash evidence remain in the printed `/tmp/safe-e2e.*/evidence.json` location.
 
 Licensed under the MIT License. See [LICENSE](./LICENSE).

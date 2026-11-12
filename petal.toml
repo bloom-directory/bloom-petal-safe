@@ -10,7 +10,7 @@ command = "scripts/build.sh"
 outputs = ["petal/safe"]
 
 [consent]
-summary = "Inspect, sign, coordinate, and execute bounded Safe smart-account transactions with Bloom-held owner keys."
+summary = "Inspect, propose, sign, coordinate, and execute bounded Safe smart-account transactions with Bloom-held owner or delegate keys."
 
 [caps]
 allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:chain", "bloom:tx.outbox", "bloom:vfs.read"]
@@ -19,7 +19,7 @@ allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:chain", "bloom:tx.o
 binding = "transaction-service"
 host = "api.safe.global"
 methods = ["get", "post"]
-paths = ["/tx-service/*", "/api/v1/*"]
+paths = ["/tx-service/*", "/api/v1/*", "/api/v2/*"]
 
 [sign]
 allowed_intents = ["safe.transaction.confirm"]
