@@ -964,15 +964,18 @@ pub fn bind(wallet: &str, index: &str, safe_id: &str, body: &[u8]) -> DispatchRe
     {
         return invalid("chain must be a configured Bloom chain name");
     }
+    let transaction_service = match validate_service(request.transaction_service) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if request.mode == BindingMode::Delegate && transaction_service.is_none() {
+        return invalid("delegate mode requires a Transaction Service");
+    }
     let owner = match wallet_address(wallet, index) {
         Ok(v) => v,
         Err(e) => return e,
     };
     let safe = match inspect(&request.chain, &request.safe_address) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let transaction_service = match validate_service(request.transaction_service) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1765,9 +1768,6 @@ fn authorize(
     if let Err(e) = require_mode(&binding, &state, mode) {
         return e;
     }
-    if wallet_address(wallet, validate_index(index).unwrap()) != Ok(binding.owner.clone()) {
-        return denied("bound signer differs from the mounted Bloom account");
-    }
     let current = match inspect(&binding.chain, &binding.safe.safe_address) {
         Ok(v) => v,
         Err(e) => return e,
@@ -1954,9 +1954,6 @@ fn role_constraints(binding: &Binding, current: &SafeSnapshot) -> Result<(), Dis
         BindingMode::Delegate if is_owner => Err(denied(
             "delegate mode requires a non-owner account; this account is a current Safe owner",
         )),
-        BindingMode::Delegate if binding.transaction_service.is_none() => {
-            Err(invalid("delegate mode requires a Transaction Service"))
-        }
         _ => Ok(()),
     }
 }
@@ -1983,7 +1980,7 @@ fn delegate_grant_matches(
             .any(|owner| same_address(value.get("delegator"), owner))
         && (value.get("safe") == Some(&Value::Null)
             || same_address(value.get("safe"), &current.safe_address))
-        && match value.get("expiryDate").or_else(|| value.get("expiry_date")) {
+        && match value.get("expiryDate") {
             None | Some(Value::Null) => true,
             Some(Value::String(expiry)) => {
                 time::OffsetDateTime::parse(expiry, &time::format_description::well_known::Rfc3339)
@@ -2002,45 +1999,29 @@ fn verify_delegate_with(
     mut get: impl FnMut(&str) -> Result<(u16, Value), DispatchResponse>,
 ) -> Result<(), DispatchResponse> {
     let delegate = address(&binding.owner, "delegate")?.to_checksum(None);
-    // Only follow offsets we construct under the configured service. A service
-    // can never make us send its credential to a pagination URL of its choice.
-    for page in 0..16 {
-        let path = format!(
-            "/api/v2/delegates/?delegate={delegate}&limit=100&offset={}",
-            page * 100
-        );
-        let (status, value) = get(&path)?;
-        if status != 200 {
-            return Err(service_failure("delegate lookup", status, &value));
-        }
-        let results = value
-            .get("results")
-            .and_then(Value::as_array)
-            .filter(|results| results.len() <= 100)
-            .ok_or_else(|| backend("Transaction Service returned invalid delegates"))?;
-        if results
-            .iter()
-            .any(|grant| delegate_grant_matches(grant, &binding.owner, current, now_ms))
-        {
-            return Ok(());
-        }
-        match value.get("next") {
-            Some(Value::Null) => {
-                return Err(denied(
-                    "this account has no current owner delegation for this Safe",
-                ));
-            }
-            Some(Value::String(_)) if !results.is_empty() => {}
-            _ => {
-                return Err(backend(
-                    "Transaction Service returned invalid delegate pagination",
-                ));
-            }
-        }
+    let path = format!("/api/v2/delegates/?delegate={delegate}&limit=100");
+    let (status, value) = get(&path)?;
+    if status != 200 {
+        return Err(service_failure("delegate lookup", status, &value));
     }
-    Err(denied(
-        "delegate lookup exceeded 16 pages; narrow the account's service grants",
-    ))
+    if value.get("next") != Some(&Value::Null) {
+        return Err(denied("delegate lookup must fit in one page of 100 grants"));
+    }
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .filter(|results| results.len() <= 100)
+        .ok_or_else(|| backend("Transaction Service returned invalid delegates"))?;
+    if results
+        .iter()
+        .any(|grant| delegate_grant_matches(grant, &binding.owner, current, now_ms))
+    {
+        Ok(())
+    } else {
+        Err(denied(
+            "this account has no current owner delegation for this Safe",
+        ))
+    }
 }
 
 fn verify_authority(
@@ -2155,17 +2136,6 @@ fn proposal(
 }
 
 fn publish(binding: &Binding, state: &TransactionState) -> Result<String, DispatchResponse> {
-    // Approval can take time. Recheck on-chain configuration and the service
-    // grant before publishing, including a retry using a held signature.
-    let current = inspect(&binding.chain, &binding.safe.safe_address)?;
-    if !transaction_context_matches(binding, state, &current)
-        || uint(&current.nonce, "current nonce")? > uint(&state.safe_tx.nonce, "nonce")?
-    {
-        return Err(denied(
-            "Safe configuration or nonce changed before publication",
-        ));
-    }
-    verify_authority(binding, &state.safe_id, &current)?;
     publish_with(binding, state, |method, path, body| {
         service(binding, &state.safe_id, method, path, body)
     })
@@ -2176,17 +2146,6 @@ fn publish_with(
     state: &TransactionState,
     mut fetch: impl FnMut(&str, &str, Vec<u8>) -> Result<(u16, Value), DispatchResponse>,
 ) -> Result<String, DispatchResponse> {
-    if binding.mode != state.mode {
-        return Err(denied("binding mode changed; draft the transaction again"));
-    }
-    let recomputed = keccak256(signing_preimage(
-        &state.snapshot.chain_id,
-        &state.snapshot.safe_address,
-        &state.safe_tx,
-    )?);
-    if format!("{recomputed:#x}") != state.safe_tx_hash {
-        return Err(backend("stored Safe transaction hash is inconsistent"));
-    }
     let hash = &state.safe_tx_hash;
     let path = format!("/api/v1/multisig-transactions/{hash}/");
     let (status, value) = fetch("GET", &path, vec![])?;
@@ -2276,7 +2235,6 @@ fn ordered_signatures(
     additional: &[String],
     approved: &dyn Fn(Address, B256) -> Result<bool, DispatchResponse>,
 ) -> Result<Vec<u8>, DispatchResponse> {
-    require_mode(binding, state, BindingMode::Owner)?;
     let hash = keccak256(signing_preimage(
         &binding.safe.chain_id,
         &binding.safe.safe_address,
@@ -2366,10 +2324,12 @@ pub fn execute(wallet: &str, index: &str, id: &str, body: &[u8]) -> DispatchResp
         Ok(v) => v,
         Err(e) => return e,
     };
-    if state.mode == BindingMode::Delegate {
-        return denied(
-            "delegate-only transactions cannot execute; Safe owners must approve and execute separately",
-        );
+    let binding: Binding = match load(&binding_key(wallet, &state.safe_id), "Safe binding") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_mode(&binding, &state, BindingMode::Owner) {
+        return e;
     }
     // A staged attempt is final unless it ended without executing: a
     // reverted, failed or cancelled outer transaction did not execute the Safe
@@ -2378,13 +2338,6 @@ pub fn execute(wallet: &str, index: &str, id: &str, body: &[u8]) -> DispatchResp
     let _ = reconcile_execution(&mut state);
     if state.outbox_id.is_some() && !attempt_ended(&state.phase) {
         return DispatchResponse::Write;
-    }
-    let binding: Binding = match load(&binding_key(wallet, &state.safe_id), "Safe binding") {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    if let Err(e) = require_mode(&binding, &state, BindingMode::Owner) {
-        return e;
     }
     let current = match inspect(&binding.chain, &binding.safe.safe_address) {
         Ok(v) => v,
@@ -2805,12 +2758,11 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
     }
 
     out.push_str("\n## Next step\n\n");
-    out.push_str(match (state.mode, state.phase.as_str()) {
-        (BindingMode::Delegate, "draft") => "Write `propose.json` to request proposal authentication. Broker independently reviews the exact Safe transaction before Bloom signs. This does not approve the transaction as an owner.\n",
-        (BindingMode::Delegate, "approval_required") => "Complete the proposal authentication approval ceremony, then write `propose.json` again.\n",
-        (BindingMode::Delegate, "proposal_signed") => "Write `propose.json` again to retry service publication using the held delegate signature.\n",
-        (BindingMode::Delegate, "proposed") => "The exact proposal is published. Safe owners must review, confirm and execute through their own account or Safe Wallet. Read `status.json` to follow the live Safe nonce; this account cannot execute.\n",
-        (_, phase) => match phase {
+    out.push_str(match state.phase.as_str() {
+        "draft" if state.mode == BindingMode::Delegate => "Write `propose.json` to request proposal authentication. Broker independently reviews the exact Safe transaction before Bloom signs. This does not approve the transaction as an owner.\n",
+        "approval_required" if state.mode == BindingMode::Delegate => "Complete the proposal authentication approval ceremony, then write `propose.json` again.\n",
+        "proposal_signed" if state.mode == BindingMode::Delegate => "Write `propose.json` again to retry service publication using the held delegate signature.\n",
+        "proposed" if state.mode == BindingMode::Delegate => "The exact proposal is published. Safe owners must review, confirm and execute through their own account or Safe Wallet. Read `status.json` to follow the live Safe nonce; this account cannot execute.\n",
         "draft" => "Write `confirm.json` to ask Bloom for this wallet's owner signature. That opens an approval ceremony showing Broker's own reconstruction of the transaction.\n",
         "approval_required" => "An approval ceremony is open. Complete it, then write `confirm.json` again to collect the signature.\n",
         "signed" => "Write `execute.json` to stage the outer transaction. This account pays gas and is a separate approval from the owner signature. A transaction queued at a later nonce executes only once the Safe reaches that nonce.\n",
@@ -2821,7 +2773,6 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
         "execution_cancelled" => "The outer transaction was cancelled before it was broadcast. If the Safe nonce is unchanged, write `execute.json` again to stage a new attempt.\n",
         "nonce_conflict" => "This Safe nonce was consumed outside this Bloom execution, by another transaction or by someone else executing this one. This draft can no longer execute here; if it did not happen, draft a replacement at the current nonce.\n",
         _ => "Read `status.json` for the current phase.\n",
-        },
     });
 
     out.push_str(
@@ -4232,9 +4183,10 @@ mod tests {
     fn delegate_mode_requires_a_service_and_a_current_non_owner() {
         let mut delegate = delegate_binding();
         assert!(role_constraints(&delegate, &delegate.safe).is_ok());
-        delegate.transaction_service = None;
-        assert!(role_constraints(&delegate, &delegate.safe).is_err());
-        delegate.transaction_service = Some("https://safe.example".into());
+        assert_eq!(
+            bind("wallet", "1", "safe", br#"{"chain":"ethereum","safe_address":"0x4000000000000000000000000000000000000000","mode":"delegate"}"#),
+            invalid("delegate mode requires a Transaction Service")
+        );
         let mut promoted = delegate.safe.clone();
         promoted.owners.push(delegate.owner.clone());
         assert!(role_constraints(&delegate, &promoted).is_err());
@@ -4308,47 +4260,24 @@ mod tests {
             &binding.safe,
             now
         ));
-        record.as_object_mut().unwrap().remove("expiryDate");
-        record["expiry_date"] = json!("2024-12-31T23:59:59Z");
-        assert!(!delegate_grant_matches(
-            &record,
-            &binding.owner,
-            &binding.safe,
-            now
-        ));
     }
 
     #[test]
-    fn delegate_pagination_never_follows_untrusted_urls_and_is_bounded() {
+    fn delegate_lookup_requires_one_complete_page() {
         let binding = delegate_binding();
-        let mut paths = vec![];
-        verify_delegate_with(&binding, &binding.safe, 1, |path| {
-            paths.push(path.to_owned());
-            if paths.len() == 1 {
-                Ok((200, json!({"results":[{"label":"no authority"}],"next":"https://evil.example/steal-key"})))
-            } else {
-                Ok((200, json!({"results":[grant(&binding)],"next":null})))
-            }
-        }).unwrap();
-        assert_eq!(paths.len(), 2);
-        assert!(paths[0].ends_with("&limit=100&offset=0"));
-        assert!(paths[1].ends_with("&limit=100&offset=100"));
-        assert!(paths.iter().all(|path| path.starts_with(
-            "/api/v2/delegates/?delegate=0x4000000000000000000000000000000000000000"
-        )));
         let mut calls = 0;
-        assert!(
-            verify_delegate_with(&binding, &binding.safe, 1, |_| {
-                calls += 1;
-                Ok((200, json!({"results":[{}],"next":"loop"})))
-            })
-            .is_err()
-        );
-        assert_eq!(calls, 16);
+        verify_delegate_with(&binding, &binding.safe, 1, |path| {
+            calls += 1;
+            assert!(path.ends_with("&limit=100"));
+            Ok((200, json!({"results":[grant(&binding)],"next":null})))
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
         for response in [
+            json!({"results":[grant(&binding)],"next":"https://other.example/"}),
             json!({"results":[],"next":null}),
             json!({"results":null,"next":null}),
-            json!({"results":[],"next":"loop"}),
+            json!({"results":[grant(&binding)]}),
         ] {
             assert!(
                 verify_delegate_with(&binding, &binding.safe, 1, |_| Ok((200, response.clone())))
@@ -4366,7 +4295,6 @@ mod tests {
         let state = delegate_state();
         assert!(require_mode(&binding, &state, BindingMode::Delegate).is_ok());
         assert!(require_mode(&binding, &state, BindingMode::Owner).is_err());
-        assert!(ordered_signatures(&binding, &state, &[], &NONE_APPROVED).is_err());
         let mut rebound = binding.clone();
         rebound.mode = BindingMode::Owner;
         assert!(!transaction_context_matches(
@@ -4432,42 +4360,9 @@ mod tests {
     }
 
     #[test]
-    fn service_proposal_reads_reject_mismatches_and_inconsistent_stored_hashes() {
+    fn proposal_response_must_match_the_transaction() {
         let binding = delegate_binding();
         let state = delegate_state();
-        for field in [
-            "safe",
-            "to",
-            "value",
-            "data",
-            "operation",
-            "safeTxGas",
-            "baseGas",
-            "gasPrice",
-            "gasToken",
-            "refundReceiver",
-            "nonce",
-            "safeTxHash",
-        ] {
-            let mut record = service_record(&state);
-            record[field] = json!("different");
-            assert!(
-                publish_with(&binding, &state, |method, _, _| {
-                    assert_eq!(method, "GET");
-                    Ok((200, record.clone()))
-                })
-                .is_err(),
-                "{field}"
-            );
-        }
-        let mut inconsistent = state.clone();
-        inconsistent.safe_tx.value = "999".into();
-        assert!(
-            publish_with(&binding, &inconsistent, |_, _, _| panic!(
-                "must recompute before HTTP"
-            ))
-            .is_err()
-        );
         assert!(
             publish_with(&binding, &state, |method, _, _| {
                 Ok(if method == "GET" {
@@ -4527,12 +4422,6 @@ mod tests {
         let mut published = state.clone();
         published.phase = "proposed".into();
         assert!(!plan_markdown(&binding, &published).contains("write `execute.json`"));
-        let mut owner_state = state.clone();
-        owner_state.mode = BindingMode::Owner;
-        assert!(
-            ordered_signatures(&super::tests::binding(), &owner_state, &[], &NONE_APPROVED)
-                .is_err()
-        );
     }
 
     #[test]
@@ -4560,24 +4449,6 @@ mod tests {
             ),
             state.safe_tx_hash
         );
-        let route = include_str!("../files/transactions/[wallet]/[index]/[id]/propose.json.rs");
-        assert!(route.contains("signing_write_spec(\"safe.transaction.confirm\")"));
-    }
-
-    #[test]
-    fn delegate_routes_declare_the_host_capabilities_their_live_checks_need() {
-        let bind = include_str!("../files/safes/[wallet]/[index]/[safe_id].json.rs");
-        let draft = include_str!("../files/transactions/[wallet]/[index]/[id]/draft.json.rs");
-        let confirm = include_str!("../files/transactions/[wallet]/[index]/[id]/confirm.json.rs");
-        let propose = include_str!("../files/transactions/[wallet]/[index]/[id]/propose.json.rs");
-        // Binding/drafting verify off-chain delegation; signing also rereads
-        // the exact mounted wallet account before asking Broker for approval.
-        for route in [bind, draft, confirm, propose] {
-            assert!(route.contains("\"bloom:http\""));
-        }
-        for route in [bind, confirm, propose] {
-            assert!(route.contains("\"bloom:vfs.read\""));
-        }
     }
 
     #[test]

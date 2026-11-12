@@ -66,7 +66,7 @@ For a [Safe proposer](https://help.safe.global/articles/1671337645-proposers), b
 }
 ```
 
-An owner must have already registered this account as a [service delegate](https://docs.safe.global/core-api/transaction-service-guides/delegates). Bloom checks `/api/v2/delegates/` against the owners read from chain, accepting either a grant scoped to this Safe or a global grant (`safe: null`) from a current owner. Expired, revoked, foreign-Safe, or former-owner grants do not authorize proposing. Checks run at binding, drafting, signing and publication; service failures block delegate use. Pagination is bounded to 16 pages of 100 records and follows locally constructed offsets, never a returned URL. The Transaction Service is the authority for these off-chain grants; this is not on-chain spending permission.
+An owner must have registered this account as a delegate for this Safe or globally, and the grant must not be expired.
 
 Delegate mode rejects an account that is also a Safe owner. Changing a binding's mode requires a new draft; an existing draft retains its original mode.
 
@@ -146,11 +146,9 @@ Write an empty body to `.../<transaction-id>/confirm.json`. Bloom displays Broke
 
 If the binding has a Transaction Service, the Petal proposes a new transaction or adds its confirmation to an existing exact transaction. Service responses are checked against every Safe transaction field and hash. Without a service, the signature remains in Petal-private state for direct execution.
 
-For a delegate draft, read `plan.md`, then write an empty body to `.../<transaction-id>/propose.json` instead. Complete Broker's approval ceremony and retry the write to collect the signature and publish. This signature authenticates the service proposal and contributes **zero** owner confirmations. It is held privately, separately from owner signatures, and is never returned by a route read. A retry finding an existing exact proposal succeeds without posting to the owner confirmations endpoint. `confirm.json` and `execute.json` are refused for delegate drafts; owners must confirm and execute using their own account or Safe Wallet.
+For a delegate draft, write an empty body to `.../<transaction-id>/propose.json`, complete Bloom's approval ceremony, then retry the write to publish. This authenticates the proposal without adding an owner confirmation; owners approve and execute it in Safe Wallet or through their own account.
 
-Delegate proposal signing retains the existing `safe.transaction.confirm` operation and `bloom.safe.review.v1` envelope so Broker still independently reconstructs and reviews the exact transaction. The legacy envelope's `owner` field identifies the Bloom signer, including a delegate. Current Broker ceremony details label that account `Signing owner` / `Signing owner · EOA`; those labels do not establish membership or make a delegate signature count toward the threshold. The Petal verifies the signer's actual role against current chain state. No Broker upgrade is required.
-
-`status.json` exposes the draft's `mode`, proposal publication state and live Safe nonce. When someone else consumes the nonce it reports `nonce_conflict`; it does not prove which external transaction executed or fetch external owner confirmations. Use Safe Wallet for that confirmation and execution history. Neither `status.json` nor `plan.md` includes the proposal signature.
+`status.json` reports proposal publication and nonce consumption; use Safe Wallet for owner confirmations and execution history.
 
 ## Execute
 

@@ -1,5 +1,5 @@
 petal::route_file!(
-    spec: petal::signing_write_spec("safe.transaction.confirm").caps(&["bloom:store","bloom:chain","bloom:sign","bloom:http","bloom:vfs.read"]),
+    spec: petal::signing_write_spec("safe.transaction.confirm").caps(&["bloom:store","bloom:chain","bloom:sign","bloom:http"]),
     read: |ctx:&petal::Ctx| {
         let wallet=match petal::wallet_param(ctx){Ok(v)=>v,Err(e)=>return e};
         let index=match petal::param(ctx,"index"){Ok(v)=>v,Err(e)=>return e};
