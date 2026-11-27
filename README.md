@@ -15,7 +15,7 @@ bloom petals ls
 
 The wallet policy must allow the Petal package and carry `{"chain": "evm-<chain id>", "destination": "exact"}` (Broker keys Safe signing by chain id, for example `evm-1` for Ethereum mainnet). For owner-mode execution, it must also allow the Safe address as a destination on the chain's configured Bloom name, for example `{"chain": "ethereum", "destination": "0x<safe>"}`, because the outer `execTransaction` goes through Bloom's native outbox. Add that destination through the normal wallet policy-update flow before staging execution. A missing destination causes a policy refusal; confirming the execution does not automatically open a policy-update ceremony. Delegate-only proposing needs the signing policy but no outbox destination or gas funding.
 
-To use a self-hosted Transaction Service, configure the Petal endpoint binding `transaction-service` to its HTTPS origin and store the same origin in the binding; it must serve `/api/v1/` at the root, plus `/api/v2/delegates/` for delegate mode.
+To use a self-hosted service, configure the Petal endpoint binding `transaction-service` to its HTTPS origin and store the same origin in the binding. A Queue Service must serve `/api/v1/multisig-transactions` and `/api/v1/delegates`; a legacy Transaction Service must serve `/api/v1/` at the root, plus `/api/v2/delegates/` for delegate mode.
 
 ## Create a Safe
 
@@ -43,15 +43,46 @@ Write this JSON to `petals/safe/safes/<wallet>/<index>/<safe-id>.json`:
 {
   "chain": "ethereum",
   "safe_address": "0x...",
-  "transaction_service": "https://api.safe.global/tx-service/eth"
+  "transaction_service": "https://api.safe.global/queue"
 }
 ```
 
-`transaction_service` is optional. Safe's hosted service is
-`https://api.safe.global/tx-service/<slug>`, for example `eth`, `base`, `arb1`,
-`oeth`, `gno` or `sep`. The old `safe-transaction-<network>.safe.global` hosts
-now redirect there, and Bloom does not follow redirects to an undeclared host,
-so bind the new base directly. Omit the field to collect signatures offline.
+`transaction_service` is optional; omit it to collect signatures offline.
+Safe's hosted queueing service is the multichain
+[Safe Queue Service](https://docs.safe.global/core-api/safe-queue-service-migration)
+at `https://api.safe.global/queue`, one base URL for every chain. This is the
+default, so no `api` field is needed for it.
+
+The per-chain Transaction Service queue endpoints
+(`https://api.safe.global/tx-service/<slug>`, for example `eth`, `base`,
+`arb1`, `oeth`, `gno` or `sep`) are deprecated and shut down on
+**19 January 2027**. Until then they can still be used by naming them:
+
+```json
+{
+  "chain": "ethereum",
+  "safe_address": "0x...",
+  "transaction_service": "https://api.safe.global/tx-service/eth",
+  "api": "transaction_service"
+}
+```
+
+`api` is `queue` (the default) or `transaction_service`. The two differ in
+paths, in request and response field names, and in which side computes
+`safeTxHash`, so the binding names the API instead of the Petal guessing it
+from the URL. A base URL and an `api` that disagree are refused by the service
+rather than silently falling back to the other dialect. A binding written
+before this field existed keeps the Transaction Service it was made for; rebind
+the Safe to move it to the Queue Service. The old
+`safe-transaction-<network>.safe.global` hosts redirect to the hosted bases,
+and Bloom does not follow redirects to an undeclared host, so bind a current
+base directly.
+
+Nothing about owner signing changes with the service: the Safe transaction
+hash is EIP-712 over the Safe's own domain, computed here from chain state, and
+is the same on either service. The Queue Service's own typed data, for
+delegate registration and proposal deletion, carries a different domain name;
+this Petal signs neither.
 
 Bloom verifies code at the address, chain ID, singleton, `VERSION()`, owners, threshold, nonce, guard, all enabled modules (up to 64), and fallback handler. The default `"mode":"owner"` requires the EVM address of the account the route is mounted under (`wallets/<wallet>/<index>/address.evm`) to be a current owner. Read the same path to compare the bound configuration with current chain state.
 
@@ -62,15 +93,16 @@ For a [Safe proposer](https://help.safe.global/articles/1671337645-proposers), b
   "chain": "ethereum",
   "safe_address": "0x...",
   "mode": "delegate",
-  "transaction_service": "https://api.safe.global/tx-service/eth"
+  "transaction_service": "https://api.safe.global/queue"
 }
 ```
 
-An owner must have registered this account as a delegate for this Safe or globally, and the grant must not be expired.
+An owner must have registered this account as a delegate for this Safe or globally, and the grant must not be expired. Queue Service delegations also carry the chain they were made for: a grant for another chain is not authority here, an all-chain grant is, and a grant that names no chain at all is refused rather than read as unscoped. Queue Service grants have no expiry at all; a legacy grant's `expiryDate` is still honoured.
 
 Delegate mode rejects an account that is also a Safe owner. Changing a binding's mode requires a new draft; an existing draft retains its original mode.
 
-Hosted Safe Transaction Service API keys are optional and write-only:
+Hosted Safe API keys are optional and write-only. The same key works for the
+Queue Service and the Transaction Service:
 
 ```text
 petals/safe/service-keys/<wallet>/<index>/<safe-id>
@@ -144,7 +176,9 @@ ceremony, not this file, is what authorizes a signature.
 
 Write an empty body to `.../<transaction-id>/confirm.json`. Bloom displays Broker's independently decoded Safe review, then signs the exact EIP-712 Safe transaction. Retry the same write after approval. The Petal recovers the owner address from the returned signature.
 
-If the binding has a Transaction Service, the Petal proposes a new transaction or adds its confirmation to an existing exact transaction. Service responses are checked against every Safe transaction field and hash. Without a service, the signature remains in Petal-private state for direct execution.
+If the binding has a service, the Petal proposes a new transaction or adds its confirmation to an existing exact transaction. Service responses are checked against every Safe transaction field, the chain and the hash. Without a service, the signature remains in Petal-private state for direct execution.
+
+The Queue Service computes `safeTxHash` itself and drops body fields it does not recognise, so a proposal cannot pin a hash the way the Transaction Service's `contractTransactionHash` did. The Petal reads a new proposal back under the hash it computed from chain state instead, and refuses it unless every signed field, the Safe and the chain still agree; a record that states no calldata at all is refused rather than read as an empty one. No status is proof by itself. An owner confirmation, whether it was accepted or reported as already held, counts only once the record read back is this transaction and holds a signature that recovers to this Bloom account, and the same read-back is what makes an owner-mode proposal a confirmed one. A read-back that cannot be had fails the write rather than reporting a confirmation the service may never have kept.
 
 For a delegate draft, write an empty body to `.../<transaction-id>/propose.json`, complete Bloom's approval ceremony, then retry the write to publish. This authenticates the proposal without adding an owner confirmation; owners approve and execute it in Safe Wallet or through their own account.
 

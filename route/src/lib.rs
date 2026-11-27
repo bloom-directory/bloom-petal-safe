@@ -33,6 +33,25 @@ pub enum BindingMode {
     Delegate,
 }
 
+/// Which queueing API the bound service speaks.
+///
+/// Safe's multichain Queue Service (`https://api.safe.global/queue`) replaced
+/// the per-chain Transaction Service queue endpoints; the old ones are
+/// scheduled to shut down on 2027-01-19. The two differ in paths, in request
+/// and response field names, and in which side computes `safeTxHash`, so the
+/// binding names the API instead of the Petal guessing it from a URL: a
+/// service that could steer which dialect is used could steer which checks
+/// apply.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceApi {
+    /// Safe Queue Service, `/api/v1` with `chainId` in the payload.
+    #[default]
+    Queue,
+    /// Legacy per-chain Safe Transaction Service queue endpoints.
+    TransactionService,
+}
+
 sol! {
     function VERSION() external view returns (string);
     function getOwners() external view returns (address[]);
@@ -63,6 +82,8 @@ pub struct BindingRequest {
     pub transaction_service: Option<String>,
     #[serde(default)]
     pub mode: BindingMode,
+    #[serde(default)]
+    pub api: ServiceApi,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -93,6 +114,22 @@ pub struct Binding {
     pub safe: SafeSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction_service: Option<String>,
+    #[serde(default = "legacy_api")]
+    pub api: ServiceApi,
+}
+
+/// The API a binding stored without the field was made for.
+///
+/// A new binding always carries `api`, so this default only ever applies to
+/// one written before the field existed -- when the Petal spoke only the
+/// per-chain Transaction Service, and the base URL it stored is a
+/// `tx-service` one. Those bindings keep that API and the checks that go with
+/// it. Reading them as the Queue Service instead would address Queue Service
+/// paths under a legacy base and change which side is trusted for
+/// `safeTxHash`. A binding is rebound to move it to the Queue Service, which
+/// re-reads the Safe from chain state.
+fn legacy_api() -> ServiceApi {
+    ServiceApi::TransactionService
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -897,10 +934,11 @@ fn inspect(chain: &str, safe: &str) -> Result<SafeSnapshot, DispatchResponse> {
     })
 }
 
-/// A Transaction Service base URL: an HTTPS origin, optionally followed by a
-/// fixed path prefix such as Safe's hosted `/tx-service/eth`. No userinfo,
-/// query, fragment or dot segments, so the base cannot smuggle a request
-/// elsewhere; the host is still bounded by the manifest's `net.allow`.
+/// A queueing service base URL: an HTTPS origin, optionally followed by a
+/// fixed path prefix such as Safe's hosted `/queue` or the legacy
+/// `/tx-service/eth`. No userinfo, query, fragment or dot segments, so the
+/// base cannot smuggle a request elsewhere; the host is still bounded by the
+/// manifest's `net.allow`.
 fn validate_service(value: Option<String>) -> Result<Option<String>, DispatchResponse> {
     value
         .map(|mut value| {
@@ -969,8 +1007,9 @@ pub fn bind(wallet: &str, index: &str, safe_id: &str, body: &[u8]) -> DispatchRe
         Err(e) => return e,
     };
     if request.mode == BindingMode::Delegate && transaction_service.is_none() {
-        return invalid("delegate mode requires a Transaction Service");
+        return invalid("delegate mode requires a queueing service");
     }
+    let api = request.api;
     let owner = match wallet_address(wallet, index) {
         Ok(v) => v,
         Err(e) => return e,
@@ -987,6 +1026,7 @@ pub fn bind(wallet: &str, index: &str, safe_id: &str, body: &[u8]) -> DispatchRe
         chain: request.chain,
         safe,
         transaction_service,
+        api,
     };
     if let Err(e) = verify_authority(&binding, safe_id, &binding.safe) {
         return e;
@@ -1901,7 +1941,7 @@ fn service(
     let origin = binding
         .transaction_service
         .as_deref()
-        .ok_or_else(|| invalid("this Safe has no Transaction Service"))?;
+        .ok_or_else(|| invalid("this Safe has no queueing service"))?;
     let mut headers = vec![("content-type".into(), "application/json".into())];
     let key = api_key(binding, safe_id);
     if let Some(key) = &key {
@@ -1940,7 +1980,7 @@ fn service_body(status: u16, body: &[u8]) -> Result<Value, DispatchResponse> {
             Ok(Value::String(String::from_utf8_lossy(body).into_owned()))
         }
         Err(e) => Err(backend(format!(
-            "Transaction Service returned invalid JSON: {e}"
+            "queueing service returned invalid JSON: {e}"
         ))),
     }
 }
@@ -1960,11 +2000,20 @@ fn role_constraints(binding: &Binding, current: &SafeSnapshot) -> Result<(), Dis
 
 /// Grants are service authority only. The delegator must still own the Safe
 /// on chain; labels, service owner lists and pagination URLs convey no trust.
+///
+/// The Queue Service answers for every chain at one base URL, so a grant now
+/// carries the chain it was made for: `chainId` is `null` for an all-chain
+/// delegation and otherwise names one chain. A grant that names another chain
+/// is not authority here, and a grant that names no chain at all is refused
+/// the same way a grant missing its `safe` scope is, rather than being read as
+/// unscoped. The legacy Transaction Service is reached per chain through its
+/// own base URL and sends no `chainId`.
 fn delegate_grant_matches(
     value: &Value,
     delegate: &str,
     current: &SafeSnapshot,
     now_ms: u64,
+    api: ServiceApi,
 ) -> bool {
     let same_address = |value: Option<&Value>, expected: &str| {
         value.and_then(Value::as_str).is_some_and(|value| {
@@ -1973,7 +2022,15 @@ fn delegate_grant_matches(
             })
         })
     };
-    same_address(value.get("delegate"), delegate)
+    let chain_scope = match (api, value.get("chainId")) {
+        (ServiceApi::TransactionService, None) => true,
+        (_, Some(Value::Null)) => true,
+        (_, Some(Value::String(chain))) => chain == &current.chain_id,
+        (_, Some(Value::Number(chain))) => chain.to_string() == current.chain_id,
+        _ => false,
+    };
+    chain_scope
+        && same_address(value.get("delegate"), delegate)
         && current
             .owners
             .iter()
@@ -1999,7 +2056,16 @@ fn verify_delegate_with(
     mut get: impl FnMut(&str) -> Result<(u16, Value), DispatchResponse>,
 ) -> Result<(), DispatchResponse> {
     let delegate = address(&binding.owner, "delegate")?.to_checksum(None);
-    let path = format!("/api/v2/delegates/?delegate={delegate}&limit=100");
+    // No `chainId` filter: a chain-scoped query would be answered without the
+    // all-chain grants that also authorize this Safe, and the filter is not a
+    // trust boundary anyway -- every returned grant is matched against this
+    // Safe, its current owners and this chain below.
+    let path = match binding.api {
+        ServiceApi::Queue => format!("/api/v1/delegates?delegate={delegate}&limit=100"),
+        ServiceApi::TransactionService => {
+            format!("/api/v2/delegates/?delegate={delegate}&limit=100")
+        }
+    };
     let (status, value) = get(&path)?;
     if status != 200 {
         return Err(service_failure("delegate lookup", status, &value));
@@ -2011,10 +2077,10 @@ fn verify_delegate_with(
         .get("results")
         .and_then(Value::as_array)
         .filter(|results| results.len() <= 100)
-        .ok_or_else(|| backend("Transaction Service returned invalid delegates"))?;
+        .ok_or_else(|| backend("queueing service returned invalid delegates"))?;
     if results
         .iter()
-        .any(|grant| delegate_grant_matches(grant, &binding.owner, current, now_ms))
+        .any(|grant| delegate_grant_matches(grant, &binding.owner, current, now_ms, binding.api))
     {
         Ok(())
     } else {
@@ -2080,16 +2146,16 @@ fn service_failure(action: &str, status: u16, value: &Value) -> DispatchResponse
         .collect();
     if reason.is_empty() {
         backend(format!(
-            "Transaction Service {action} failed with status {status}"
+            "queueing service {action} failed with status {status}"
         ))
     } else {
         backend(format!(
-            "Transaction Service {action} failed with status {status}: {reason}"
+            "queueing service {action} failed with status {status}: {reason}"
         ))
     }
 }
 
-fn service_tx_matches(value: &Value, state: &TransactionState) -> bool {
+fn service_tx_matches(value: &Value, state: &TransactionState, api: ServiceApi) -> bool {
     let field = |name: &str| value.get(name).and_then(|v| v.as_str());
     let number = |name: &str, expected: &str| {
         value.get(name).is_some_and(|v| {
@@ -2098,41 +2164,128 @@ fn service_tx_matches(value: &Value, state: &TransactionState) -> bool {
                     .is_some_and(|number| number.to_string() == expected)
         })
     };
-    field("safe").is_some_and(|v| v.eq_ignore_ascii_case(&state.snapshot.safe_address))
-        && field("to").is_some_and(|v| v.eq_ignore_ascii_case(&state.safe_tx.to))
+    // The Queue Service answers `null` for an address it holds as zero, where
+    // the Transaction Service echoed the zero address itself. A `null` is
+    // therefore the zero address and nothing else: it never stands in for the
+    // address this Petal expects.
+    let same_address = |name: &str, expected: &str| match value.get(name) {
+        Some(Value::Null) => expected.eq_ignore_ascii_case(ZERO),
+        Some(Value::String(held)) => held.eq_ignore_ascii_case(expected),
+        _ => false,
+    };
+    // `data` is the calldata the Safe will run, and the field a record is
+    // least able to be vague about. A missing or non-string `data` proves
+    // nothing about what the service stored, so it is refused rather than read
+    // as empty calldata. Both services answer `null` where they hold no
+    // calldata, so a `null` is empty calldata and nothing else: it never
+    // stands in for the calldata this Petal signed.
+    let data_matches = match value.get("data") {
+        Some(Value::Null) => state.safe_tx.data.eq_ignore_ascii_case("0x"),
+        Some(Value::String(held)) => held.eq_ignore_ascii_case(&state.safe_tx.data),
+        _ => false,
+    };
+    // One service now answers for every chain, so the chain is part of the
+    // record and is required with it. `safeTxHash` already commits to the
+    // chain through the EIP-712 domain, and this refuses a mismatch outright
+    // rather than resting on that.
+    let chain_matches = match api {
+        ServiceApi::Queue => number("chainId", &state.snapshot.chain_id),
+        ServiceApi::TransactionService => value
+            .get("chainId")
+            .is_none_or(|_| number("chainId", &state.snapshot.chain_id)),
+    };
+    chain_matches
+        && same_address("safe", &state.snapshot.safe_address)
+        && same_address("to", &state.safe_tx.to)
         && number("value", &state.safe_tx.value)
-        && field("data")
-            .unwrap_or("0x")
-            .eq_ignore_ascii_case(&state.safe_tx.data)
+        && data_matches
         && number("operation", &state.safe_tx.operation.to_string())
         && number("safeTxGas", &state.safe_tx.safe_tx_gas)
         && number("baseGas", &state.safe_tx.base_gas)
         && number("gasPrice", &state.safe_tx.gas_price)
-        && field("gasToken").is_some_and(|v| v.eq_ignore_ascii_case(&state.safe_tx.gas_token))
-        && field("refundReceiver")
-            .is_some_and(|v| v.eq_ignore_ascii_case(&state.safe_tx.refund_receiver))
+        && same_address("gasToken", &state.safe_tx.gas_token)
+        && same_address("refundReceiver", &state.safe_tx.refund_receiver)
         && number("nonce", &state.safe_tx.nonce)
         && field("safeTxHash").is_some_and(|v| v.eq_ignore_ascii_case(&state.safe_tx_hash))
 }
 
+/// Where one Safe transaction is read by its hash.
+fn transaction_path(api: ServiceApi, hash: &str) -> String {
+    match api {
+        ServiceApi::Queue => format!("/api/v1/multisig-transactions/{hash}"),
+        ServiceApi::TransactionService => format!("/api/v1/multisig-transactions/{hash}/"),
+    }
+}
+
+/// Where an owner signature is added to a transaction the service already
+/// holds, and the body that carries it. The Queue Service takes a list of up
+/// to 50; this Petal holds exactly one signature per transaction and sends
+/// only that one.
+fn confirmation(api: ServiceApi, hash: &str, signature: &str) -> (String, Value) {
+    match api {
+        ServiceApi::Queue => (
+            format!("/api/v1/multisig-transactions/{hash}/signatures"),
+            json!({"signatures":[signature]}),
+        ),
+        ServiceApi::TransactionService => (
+            format!("/api/v1/multisig-transactions/{hash}/confirmations/"),
+            json!({"signature":signature}),
+        ),
+    }
+}
+
 /// The hosted Transaction Service refuses any address that is not EIP-55
-/// checksummed, in the path and in the body alike.
+/// checksummed, in the path and in the body alike. The Queue Service accepts
+/// any case, so one checksummed form satisfies both.
+///
+/// The two proposals differ in more than their path. The Queue Service takes
+/// `chainId` and `safe` in the body rather than the chain in the base URL and
+/// the Safe in the path, takes a `signatures` list where the Transaction
+/// Service took a single `signature`, splits `origin` into `originName` and
+/// `originUrl`, and drops `sender` and `contractTransactionHash`: it derives
+/// the proposer from the first signature and computes `safeTxHash` itself.
+/// Unknown body fields are dropped silently there, so sending the retired
+/// `contractTransactionHash` would look like a hash pin while pinning nothing.
+/// `publish_with` reads the proposal back under the locally computed hash
+/// instead.
 fn proposal(
     binding: &Binding,
     state: &TransactionState,
 ) -> Result<(String, Value), DispatchResponse> {
     let checksum = |value: &str, field: &str| Ok(address(value, field)?.to_checksum(None));
     let safe = checksum(&binding.safe.safe_address, "safe")?;
-    let body = json!({
-        "safe":safe,"to":checksum(&state.safe_tx.to, "to")?,"value":state.safe_tx.value,"data":state.safe_tx.data,
-        "operation":state.safe_tx.operation,"gasToken":checksum(&state.safe_tx.gas_token, "gasToken")?,
-        "safeTxGas":state.safe_tx.safe_tx_gas,"baseGas":state.safe_tx.base_gas,"gasPrice":state.safe_tx.gas_price,
-        "refundReceiver":checksum(&state.safe_tx.refund_receiver, "refundReceiver")?,
-        "nonce":state.safe_tx.nonce,"contractTransactionHash":state.safe_tx_hash,
-        "sender":checksum(&binding.owner, "sender")?,
-        "signature":held_signature(state),"origin":"Bloom Safe Petal"
-    });
-    Ok((format!("/api/v1/safes/{safe}/multisig-transactions/"), body))
+    // Never offer an unsigned proposal: the signature is what authenticates
+    // this one as an owner confirmation or a delegate proposal.
+    let signature = held_signature(state)
+        .ok_or_else(|| backend("no held signature for this Safe transaction"))?;
+    let to = checksum(&state.safe_tx.to, "to")?;
+    let gas_token = checksum(&state.safe_tx.gas_token, "gasToken")?;
+    let refund_receiver = checksum(&state.safe_tx.refund_receiver, "refundReceiver")?;
+    Ok(match binding.api {
+        ServiceApi::Queue => (
+            "/api/v1/multisig-transactions".into(),
+            json!({
+                "chainId":binding.safe.chain_id,"safe":safe,"to":to,"value":state.safe_tx.value,
+                "data":state.safe_tx.data,"operation":state.safe_tx.operation,"gasToken":gas_token,
+                "safeTxGas":state.safe_tx.safe_tx_gas,"baseGas":state.safe_tx.base_gas,
+                "gasPrice":state.safe_tx.gas_price,"refundReceiver":refund_receiver,
+                "nonce":state.safe_tx.nonce,"signatures":[signature],
+                "originName":"Bloom Safe Petal"
+            }),
+        ),
+        ServiceApi::TransactionService => (
+            format!("/api/v1/safes/{safe}/multisig-transactions/"),
+            json!({
+                "safe":safe,"to":to,"value":state.safe_tx.value,"data":state.safe_tx.data,
+                "operation":state.safe_tx.operation,"gasToken":gas_token,
+                "safeTxGas":state.safe_tx.safe_tx_gas,"baseGas":state.safe_tx.base_gas,
+                "gasPrice":state.safe_tx.gas_price,"refundReceiver":refund_receiver,
+                "nonce":state.safe_tx.nonce,"contractTransactionHash":state.safe_tx_hash,
+                "sender":checksum(&binding.owner, "sender")?,
+                "signature":signature,"origin":"Bloom Safe Petal"
+            }),
+        ),
+    })
 }
 
 fn publish(binding: &Binding, state: &TransactionState) -> Result<String, DispatchResponse> {
@@ -2146,46 +2299,206 @@ fn publish_with(
     state: &TransactionState,
     mut fetch: impl FnMut(&str, &str, Vec<u8>) -> Result<(u16, Value), DispatchResponse>,
 ) -> Result<String, DispatchResponse> {
-    let hash = &state.safe_tx_hash;
-    let path = format!("/api/v1/multisig-transactions/{hash}/");
-    let (status, value) = fetch("GET", &path, vec![])?;
+    let api = binding.api;
+    let lookup = transaction_path(api, &state.safe_tx_hash);
+    let (status, value) = fetch("GET", &lookup, vec![])?;
     if status == 200 {
-        if !service_tx_matches(&value, state) {
-            return Err(denied(
-                "Transaction Service returned different Safe transaction fields",
-            ));
+        if let Some(outcome) = held_outcome(binding, state, &value, &mut fetch)? {
+            return Ok(outcome);
         }
-        // The delegate's signature only authenticates creation. An existing
-        // exact proposal is success, including recovery after a lost POST
-        // response. Never send it to the owner confirmations endpoint.
-        if state.mode == BindingMode::Delegate {
-            return Ok("proposed".into());
-        }
-        let confirm_path = format!("/api/v1/multisig-transactions/{hash}/confirmations/");
-        let (status, value) = fetch(
-            "POST",
-            &confirm_path,
-            serde_json::to_vec(&json!({"signature":state.owner_signature})).unwrap(),
-        )?;
-        if !(200..300).contains(&status) {
-            return Err(service_failure("confirmation", status, &value));
-        }
-        return Ok("confirmed".into());
-    }
-    if status != 404 {
+    } else if status != 404 {
         return Err(service_failure("lookup", status, &value));
     }
     let (path, body) = proposal(binding, state)?;
     let (status, value) = fetch("POST", &path, serde_json::to_vec(&body).unwrap())?;
+    // The Queue Service answers 409 for a hash it already holds: a proposal
+    // that landed between the lookup and this write, or this one after a lost
+    // response. Either way what it holds must still be exactly this
+    // transaction, it must be a proposal owners can see, and in owner mode it
+    // still needs this confirmation.
+    if status == 409 {
+        let (status, held) = fetch("GET", &lookup, vec![])?;
+        if status != 200 {
+            return Err(service_failure("proposal", status, &held));
+        }
+        return held_outcome(binding, state, &held, &mut fetch)?
+            .ok_or_else(|| denied(UNPUBLISHED_PROPOSAL));
+    }
     if !(200..300).contains(&status) {
         return Err(service_failure("proposal", status, &value));
     }
-    if !value.is_null() && !service_tx_matches(&value, state) {
+    // The Transaction Service was sent `contractTransactionHash`, so it
+    // refuses fields that do not hash to it and a non-null echo can be checked
+    // where it stands. That is one more refusal and never a substitute for the
+    // read-back: the echo says nothing about whether the service kept the
+    // proposal as one owners can see, nor whether it kept the owner signature
+    // the creation carried, and an empty body says nothing at all.
+    if api == ServiceApi::TransactionService
+        && !value.is_null()
+        && !service_tx_matches(&value, state, api)
+    {
         return Err(denied(
-            "Transaction Service returned different Safe transaction fields after proposal",
+            "queueing service returned different Safe transaction fields after proposal",
         ));
     }
-    Ok("proposed".into())
+    // Nothing in the write proves what the service stored: the Queue Service
+    // computes `safeTxHash` itself and answers a creation with the new
+    // confirmations rather than the transaction, and the Transaction Service
+    // may answer an accepted creation with nothing. Reading the record back
+    // under the hash this Petal computed does prove it: that hash commits to
+    // the chain, the Safe and every signed field, and the fields are checked
+    // again against it.
+    let (status, held) = fetch("GET", &lookup, vec![])?;
+    if status != 200 {
+        return Err(service_failure("proposal read-back", status, &held));
+    }
+    if !service_tx_matches(&held, state, api) {
+        return Err(denied(
+            "queueing service returned different Safe transaction fields after proposal",
+        ));
+    }
+    match state.mode {
+        // In owner mode the proposal carried this account's owner signature as
+        // the creation's authentication, so success here claims the service
+        // holds that confirmation. Matching fields do not show it: either
+        // service keeps the signatures separately from the signed fields, so a
+        // record reads the same with none of them -- including a creation that
+        // stored the transaction and silently dropped the signature, which the
+        // Transaction Service's hash pin does nothing to prevent. Only a
+        // signature in the record that recovers to this account proves it.
+        BindingMode::Owner if !record_holds_owner_confirmation(binding, state, &held)? => {
+            Err(denied(UNSTORED_CONFIRMATION))
+        }
+        // A delegate contributes no confirmation, so what is checked instead is
+        // that the service holds the proposal where owners are shown it.
+        BindingMode::Delegate if !proposal_is_published(&held, api) => {
+            Err(denied(UNPUBLISHED_PROPOSAL))
+        }
+        _ => Ok("proposed".into()),
+    }
+}
+
+const UNPUBLISHED_PROPOSAL: &str = "queueing service holds this Safe transaction as an untrusted proposal that owners are not shown";
+
+const UNSTORED_CONFIRMATION: &str =
+    "queueing service does not hold this account's owner confirmation of this Safe transaction";
+
+/// What a record the service already holds means for this draft, or `None` if
+/// it is not an outcome and the proposal should be sent.
+fn held_outcome(
+    binding: &Binding,
+    state: &TransactionState,
+    held: &Value,
+    fetch: &mut impl FnMut(&str, &str, Vec<u8>) -> Result<(u16, Value), DispatchResponse>,
+) -> Result<Option<String>, DispatchResponse> {
+    if !service_tx_matches(held, state, binding.api) {
+        return Err(denied(
+            "queueing service returned different Safe transaction fields",
+        ));
+    }
+    // The delegate's signature only authenticates creation, so an existing
+    // exact proposal is the outcome itself rather than something to confirm,
+    // including recovery after a lost POST response. It is never sent to the
+    // owner confirmations endpoint. It is only success once the service holds
+    // it as a proposal owners are shown; where it does not, `None` sends the
+    // delegate proposal, which is what can publish such a record, instead of
+    // reporting a proposal nobody will see as published.
+    if state.mode == BindingMode::Delegate {
+        return Ok(proposal_is_published(held, binding.api).then(|| "proposed".to_owned()));
+    }
+    confirm_held(binding, state, fetch).map(Some)
+}
+
+/// Whether a record the service holds is a proposal owners are shown.
+///
+/// The Queue Service derives a proposal's proposer from a signature it
+/// requires with the creation, so every record it holds was authenticated when
+/// it was made.
+///
+/// The Transaction Service also stores proposals it did not authenticate,
+/// marked `trusted: false` and left out of the listings owners read; anyone who
+/// can reach the service can leave one under any hash, including this one.
+/// Such a record is not this account's proposal and is not published, so only
+/// an explicit `trusted: true` counts here. Absent, `false`, a string, or
+/// anything else is not proof.
+fn proposal_is_published(held: &Value, api: ServiceApi) -> bool {
+    match api {
+        ServiceApi::Queue => true,
+        ServiceApi::TransactionService => held.get("trusted") == Some(&Value::Bool(true)),
+    }
+}
+
+/// Add this account's owner confirmation to a transaction the service already
+/// holds. The caller has checked that it is exactly the one drafted here.
+fn confirm_held(
+    binding: &Binding,
+    state: &TransactionState,
+    fetch: &mut impl FnMut(&str, &str, Vec<u8>) -> Result<(u16, Value), DispatchResponse>,
+) -> Result<String, DispatchResponse> {
+    let api = binding.api;
+    let signature = state
+        .owner_signature
+        .as_deref()
+        .ok_or_else(|| backend("no held owner signature for this Safe transaction"))?;
+    let (path, body) = confirmation(api, &state.safe_tx_hash, signature);
+    let (status, value) = fetch("POST", &path, serde_json::to_vec(&body).unwrap())?;
+    // A 2xx says the write was accepted, not that the confirmation was kept:
+    // the Queue Service answers a confirmation with the signatures it now
+    // holds rather than the transaction, and an empty body says nothing at
+    // all. 409 is its answer for an owner it already holds a signature from,
+    // which is also what a retry gets after a lost response. Either status is
+    // therefore ambiguous on its own, and both are resolved the same way --
+    // by reading the record back under the locally computed hash, which proves
+    // it is this transaction, and recovering a signature it holds to this
+    // account. A read-back that cannot be had, or that holds no such
+    // signature, is a failure rather than a confirmation reported on a status.
+    if !(200..300).contains(&status) && status != 409 {
+        return Err(service_failure("confirmation", status, &value));
+    }
+    if holds_owner_confirmation(binding, state, fetch)? {
+        return Ok("confirmed".into());
+    }
+    Err(denied(UNSTORED_CONFIRMATION))
+}
+
+/// Whether the service holds a signature for this transaction that recovers to
+/// this Bloom account as a current Safe owner. The record is read back under
+/// the hash computed here, and a read-back that is not available is an error.
+fn holds_owner_confirmation(
+    binding: &Binding,
+    state: &TransactionState,
+    fetch: &mut impl FnMut(&str, &str, Vec<u8>) -> Result<(u16, Value), DispatchResponse>,
+) -> Result<bool, DispatchResponse> {
+    let lookup = transaction_path(binding.api, &state.safe_tx_hash);
+    let (status, value) = fetch("GET", &lookup, vec![])?;
+    if status != 200 {
+        return Err(service_failure("confirmation read-back", status, &value));
+    }
+    record_holds_owner_confirmation(binding, state, &value)
+}
+
+/// Whether a record the service returned for this exact transaction holds a
+/// signature that recovers to this Bloom account. A record whose signed fields
+/// differ, or that carries no confirmations at all, is refused by
+/// `service_confirmations` rather than read as holding none.
+fn record_holds_owner_confirmation(
+    binding: &Binding,
+    state: &TransactionState,
+    value: &Value,
+) -> Result<bool, DispatchResponse> {
+    let hash = keccak256(signing_preimage(
+        &binding.safe.chain_id,
+        &binding.safe.safe_address,
+        &state.safe_tx,
+    )?);
+    let owner = address(&binding.owner, "owner")?;
+    Ok(service_confirmations(value, state, binding.api)?
+        .iter()
+        .any(|signature| {
+            parse_signature(signature)
+                .and_then(|bytes| signature_address(&bytes, hash))
+                .is_ok_and(|recovered| recovered == owner)
+        }))
 }
 
 /// Signatures the service holds for this exact transaction. A record whose
@@ -2193,20 +2506,19 @@ fn publish_with(
 fn service_confirmations(
     value: &Value,
     state: &TransactionState,
+    api: ServiceApi,
 ) -> Result<Vec<String>, DispatchResponse> {
-    if !service_tx_matches(value, state) {
+    if !service_tx_matches(value, state, api) {
         return Err(denied(
-            "Transaction Service returned different Safe transaction fields",
+            "queueing service returned different Safe transaction fields",
         ));
     }
     let confirmations = value
         .get("confirmations")
         .and_then(Value::as_array)
-        .ok_or_else(|| backend("Transaction Service omitted confirmations"))?;
+        .ok_or_else(|| backend("queueing service omitted confirmations"))?;
     if confirmations.len() > 64 {
-        return Err(denied(
-            "Transaction Service returned too many confirmations",
-        ));
+        return Err(denied("queueing service returned too many confirmations"));
     }
     confirmations
         .iter()
@@ -2216,7 +2528,7 @@ fn service_confirmations(
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .ok_or_else(|| {
-                    denied("Transaction Service returned a confirmation without a signature")
+                    denied("queueing service returned a confirmation without a signature")
                 })
         })
         .collect()
@@ -2368,9 +2680,9 @@ pub fn execute(wallet: &str, index: &str, id: &str, body: &[u8]) -> DispatchResp
     // still meet the threshold; its failure is reported only if they do not.
     let mut service_unavailable = None;
     if binding.transaction_service.is_some() {
-        let path = format!("/api/v1/multisig-transactions/{}/", state.safe_tx_hash);
+        let path = transaction_path(binding.api, &state.safe_tx_hash);
         match service(&binding, &state.safe_id, "GET", &path, vec![]) {
-            Ok((200, value)) => match service_confirmations(&value, &state) {
+            Ok((200, value)) => match service_confirmations(&value, &state, binding.api) {
                 Ok(confirmations) => request.signatures.extend(confirmations),
                 Err(e) => return e,
             },
@@ -2766,7 +3078,7 @@ fn plan_markdown(binding: &Binding, state: &TransactionState) -> String {
         "draft" => "Write `confirm.json` to ask Bloom for this wallet's owner signature. That opens an approval ceremony showing Broker's own reconstruction of the transaction.\n",
         "approval_required" => "An approval ceremony is open. Complete it, then write `confirm.json` again to collect the signature.\n",
         "signed" => "Write `execute.json` to stage the outer transaction. This account pays gas and is a separate approval from the owner signature. A transaction queued at a later nonce executes only once the Safe reaches that nonce.\n",
-        "proposed" => "The transaction is published to the Transaction Service. Collect the remaining confirmations, then write `execute.json`.\n",
+        "proposed" => "The transaction is published to the queueing service. Collect the remaining confirmations, then write `execute.json`.\n",
         "execution_staged" => "The outer transaction is staged in Bloom's EVM outbox. Approve it as this account, then read `status.json` until it reaches `executed`, `execution_failed` or `execution_cancelled`.\n",
         "executed" => "Done. `status.json` carries both the Safe transaction hash and the outer transaction hash.\n",
         "execution_failed" => "The outer transaction did not execute. If the Safe nonce is unchanged, write `execute.json` again to stage a new attempt; Bloom refuses it once anything else has spent the nonce.\n",
@@ -3180,6 +3492,11 @@ mod tests {
 
     const NONE_APPROVED: fn(Address, B256) -> Result<bool, DispatchResponse> = |_, _| Ok(false);
 
+    /// Owners 0xf39f… and 0x7099… signing the Safe transaction hash of `tx()`
+    /// for the Safe at 0x1000… on chain 31337.
+    const OWNER_FIRST: &str = "0x9698aafeaf421f324a45e56046b6d6a2efcbdd85f8e7ce4134a827052b2e0c5a6086fd542c8757c8e614086c8da010913b0b8d578523ea728a724e636c52ee9b1c";
+    const OWNER_SECOND: &str = "0x21d5a6bbeded469398a83760c4f3b5c42779188f5c6449655d675ad387ae548f63d024139aaf2fc95b0db58d5b8d24bfc441d185b58adafab24c7a903e6079491b";
+
     fn tx() -> SafeTx {
         SafeTx {
             to: "0x4000000000000000000000000000000000000000".into(),
@@ -3226,6 +3543,7 @@ mod tests {
             chain: "ethereum".into(),
             safe,
             transaction_service: None,
+            api: ServiceApi::Queue,
         }
     }
 
@@ -3562,7 +3880,7 @@ mod tests {
             safe_tx_hash: "0xa6119a03d6d492a10575b05da6c5eb47b9aae120c346935ef329c9a9a559a509"
                 .into(),
             phase: "confirmed".into(),
-            owner_signature: None,
+            owner_signature: Some(format!("0x{}", "cd".repeat(65))),
             approval_action_id: None,
             service_status: None,
             outbox_id: None,
@@ -3571,20 +3889,22 @@ mod tests {
             library_code_hash: None,
             execution_chain: None,
         };
+        let legacy = ServiceApi::TransactionService;
         let mut response = json!({
             "safe":state.snapshot.safe_address,"to":state.safe_tx.to,"value":"7","data":null,
             "operation":0,"safeTxGas":0,"baseGas":"0","gasPrice":0,"gasToken":ZERO,
             "refundReceiver":ZERO,"nonce":4,"safeTxHash":state.safe_tx_hash
         });
-        assert!(service_tx_matches(&response, &state));
+        assert!(service_tx_matches(&response, &state, legacy));
         response["gasPrice"] = json!("1");
-        assert!(!service_tx_matches(&response, &state));
+        assert!(!service_tx_matches(&response, &state, legacy));
         response["gasPrice"] = json!(0);
         response["refundReceiver"] = json!("0x4000000000000000000000000000000000000000");
-        assert!(!service_tx_matches(&response, &state));
+        assert!(!service_tx_matches(&response, &state, legacy));
 
-        // Stored addresses are lowercase; the hosted service answers 422 to
-        // anything that is not EIP-55, in the path and in the body.
+        // Stored addresses are lowercase; the legacy hosted service answers
+        // 422 to anything that is not EIP-55, in the path and in the body, and
+        // the Queue Service accepts the same checksummed form.
         let mut state = state;
         state.safe_tx.to = "0x9f5bc439b96c8fd003b640525fea3fa0b26501c2".into();
         let binding = Binding {
@@ -3598,6 +3918,7 @@ mod tests {
                 ..state.snapshot.clone()
             },
             transaction_service: Some("https://api.safe.global/tx-service/eth".into()),
+            api: legacy,
         };
         let (path, body) = proposal(&binding, &state).unwrap();
         assert_eq!(
@@ -3609,6 +3930,164 @@ mod tests {
         assert_eq!(body["sender"], "0x977667F2D703138D8C8419531BCBE177c2D78c7d");
         assert_eq!(body["gasToken"], ZERO);
         assert_eq!(body["refundReceiver"], ZERO);
+
+        let queue = Binding {
+            api: ServiceApi::Queue,
+            transaction_service: Some("https://api.safe.global/queue".into()),
+            ..binding
+        };
+        let (path, body) = proposal(&queue, &state).unwrap();
+        assert_eq!(path, "/api/v1/multisig-transactions");
+        assert_eq!(body["chainId"], queue.safe.chain_id);
+        assert_eq!(body["safe"], "0x220866B1A2219f40e72f5c628B65D54268cA3A9D");
+        assert_eq!(body["to"], "0x9F5bc439B96c8Fd003b640525fEA3FA0B26501c2");
+        assert_eq!(body["gasToken"], ZERO);
+        assert_eq!(body["refundReceiver"], ZERO);
+    }
+
+    /// The Queue Service computes `safeTxHash` itself, derives the proposer
+    /// from the first signature, and silently drops body fields it does not
+    /// know. A retired field left in the proposal would read as a hash pin or
+    /// a declared sender while binding neither.
+    #[test]
+    fn a_queue_proposal_carries_the_chain_and_no_retired_pin_or_sender() {
+        let mut state = state("signed", TransactionRequest::Rejection);
+        state.owner_signature = Some(format!("0x{}", "ab".repeat(65)));
+        let binding = Binding {
+            transaction_service: Some("https://api.safe.global/queue".into()),
+            ..binding()
+        };
+        let (path, body) = proposal(&binding, &state).unwrap();
+        assert_eq!(path, "/api/v1/multisig-transactions");
+        assert_eq!(body["chainId"], "1");
+        assert_eq!(body["signatures"], json!([state.owner_signature]));
+        assert_eq!(body["originName"], "Bloom Safe Petal");
+        for retired in ["contractTransactionHash", "sender", "signature", "origin"] {
+            assert_eq!(body.get(retired), None, "{retired}");
+        }
+        // Every signed field still travels, and under the same name.
+        assert_eq!(body["nonce"], state.safe_tx.nonce);
+        assert_eq!(body["value"], state.safe_tx.value);
+        assert_eq!(body["data"], state.safe_tx.data);
+        assert_eq!(body["operation"], json!(state.safe_tx.operation));
+        assert_eq!(body["safeTxGas"], state.safe_tx.safe_tx_gas);
+        assert_eq!(body["baseGas"], state.safe_tx.base_gas);
+        assert_eq!(body["gasPrice"], state.safe_tx.gas_price);
+
+        // An unsigned proposal is never offered to either service.
+        state.owner_signature = None;
+        assert!(proposal(&binding, &state).is_err());
+        let legacy = Binding {
+            api: ServiceApi::TransactionService,
+            ..binding
+        };
+        assert!(proposal(&legacy, &state).is_err());
+    }
+
+    /// The Queue Service answers for every chain at one base URL, so the chain
+    /// is part of a record it returns and this Petal requires it to be this
+    /// Safe's chain. It also nulls an address it holds as zero.
+    #[test]
+    fn a_queue_record_must_name_this_chain_and_may_null_zero_addresses() {
+        let mut state = state("signed", TransactionRequest::Rejection);
+        state.safe_tx_hash = format!(
+            "{:#x}",
+            keccak256(
+                signing_preimage(
+                    &state.snapshot.chain_id,
+                    &state.snapshot.safe_address,
+                    &state.safe_tx,
+                )
+                .unwrap()
+            )
+        );
+        let api = ServiceApi::Queue;
+        let mut record = json!({
+            "chainId":"1","safe":state.snapshot.safe_address,"to":state.safe_tx.to,
+            "value":"7","data":null,"operation":0,"safeTxGas":0,"baseGas":"0","gasPrice":0,
+            "gasToken":null,"refundReceiver":null,"nonce":4,"safeTxHash":state.safe_tx_hash
+        });
+        assert!(service_tx_matches(&record, &state, api));
+        // A null address is the zero address and nothing else.
+        record["to"] = Value::Null;
+        assert!(!service_tx_matches(&record, &state, api));
+        record["to"] = json!(state.safe_tx.to);
+        // A record from another chain is not this transaction, and a record
+        // that names no chain at all is not accepted in its place.
+        for chain in [json!("137"), json!(137), Value::Null] {
+            record["chainId"] = chain.clone();
+            assert!(!service_tx_matches(&record, &state, api), "{chain}");
+        }
+        record.as_object_mut().unwrap().remove("chainId");
+        assert!(!service_tx_matches(&record, &state, api));
+        // The legacy service is reached per chain and sends no chainId, but a
+        // chain it does name still has to agree.
+        assert!(service_tx_matches(
+            &record,
+            &state,
+            ServiceApi::TransactionService
+        ));
+        record["chainId"] = json!(137);
+        assert!(!service_tx_matches(
+            &record,
+            &state,
+            ServiceApi::TransactionService
+        ));
+        record["chainId"] = json!(1);
+        assert!(service_tx_matches(
+            &record,
+            &state,
+            ServiceApi::TransactionService
+        ));
+    }
+
+    /// `data` is the calldata the Safe would run, so a record that does not
+    /// state it cannot stand in for the one that was signed. Both services
+    /// answer `null` where they hold no calldata, and that is all a `null`
+    /// means: an absent or non-string `data` is refused rather than read as
+    /// empty calldata, which would let a record match a draft whose calldata
+    /// the service never acknowledged.
+    #[test]
+    fn a_record_must_state_the_calldata_that_was_signed() {
+        let empty = state("signed", TransactionRequest::Rejection);
+        assert_eq!(empty.safe_tx.data, "0x");
+        let mut call = empty.clone();
+        call.safe_tx.data = "0x12ab".into();
+        for api in [ServiceApi::Queue, ServiceApi::TransactionService] {
+            // Empty calldata: `"0x"` as this Petal holds it, and the `null` a
+            // service answers in its place.
+            assert!(service_tx_matches(&service_record(&empty), &empty, api));
+            assert!(service_tx_matches(
+                &with(&empty, "data", Value::Null),
+                &empty,
+                api
+            ));
+            // Calldata that was signed, in either case, and nothing else.
+            assert!(service_tx_matches(
+                &with(&call, "data", json!("0x12AB")),
+                &call,
+                api
+            ));
+            for other in [json!("0x"), json!(""), json!("0x12ac"), Value::Null] {
+                assert!(
+                    !service_tx_matches(&with(&call, "data", other.clone()), &call, api),
+                    "{api:?} {other}"
+                );
+            }
+            // A record that omits `data`, or answers something that is not a
+            // hex string, proves nothing about what the service stored.
+            for state in [&empty, &call] {
+                let mut missing = service_record(state);
+                missing.as_object_mut().unwrap().remove("data");
+                assert!(!service_tx_matches(&missing, state, api), "{api:?}");
+                for malformed in [json!(0), json!(false), json!([]), json!(["0x"]), json!({})] {
+                    assert!(
+                        !service_tx_matches(&with(state, "data", malformed.clone()), state, api),
+                        "{api:?} {malformed}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -3687,25 +4166,57 @@ mod tests {
                 .unwrap()
             )
         );
+        // The Queue Service keeps `confirmations[].signature` and carries the
+        // chain alongside it; it renamed each entry's `submissionDate` to
+        // `created`, which this Petal never read.
         let record = |to: &str| {
             json!({
+                "chainId":state.snapshot.chain_id,
                 "safe":state.snapshot.safe_address,"to":to,"value":"7","data":null,"operation":0,
-                "safeTxGas":0,"baseGas":0,"gasPrice":"0","gasToken":ZERO,"refundReceiver":ZERO,
+                "safeTxGas":0,"baseGas":0,"gasPrice":"0","gasToken":null,"refundReceiver":null,
                 "nonce":4,"safeTxHash":state.safe_tx_hash,
-                "confirmations":[{"signature":"0x01"},{"signature":"0x02"}]
+                "confirmations":[{"signature":"0x01","created":"2026-11-26T00:00:00Z"},
+                                 {"signature":"0x02","created":"2026-11-26T00:00:01Z"}]
             })
         };
         assert_eq!(
-            service_confirmations(&record(&state.safe_tx.to), &state).unwrap(),
+            service_confirmations(&record(&state.safe_tx.to), &state, ServiceApi::Queue).unwrap(),
             ["0x01", "0x02"]
         );
         assert!(
             service_confirmations(
                 &record("0x5000000000000000000000000000000000000000"),
-                &state
+                &state,
+                ServiceApi::Queue
             )
             .is_err()
         );
+        // A transaction the service holds with no signatures yet is an empty
+        // list, not an error; a record that states no confirmations at all, or
+        // states them in another shape, is not read as an empty list.
+        let held = |confirmations: Value| {
+            let mut value = record(&state.safe_tx.to);
+            value["confirmations"] = confirmations;
+            service_confirmations(&value, &state, ServiceApi::Queue)
+        };
+        assert_eq!(held(json!([])).unwrap(), Vec::<String>::new());
+        let mut missing = record(&state.safe_tx.to);
+        missing.as_object_mut().unwrap().remove("confirmations");
+        assert!(service_confirmations(&missing, &state, ServiceApi::Queue).is_err());
+        for malformed in [
+            Value::Null,
+            json!({"0":{"signature":"0x01"}}),
+            json!(["0x01"]),
+            json!([{"signature":1}]),
+            json!([{"owner":"0x1"}]),
+            json!([{"signature":"0x01"},{"created":"2026-11-26T00:00:00Z"}]),
+        ] {
+            assert!(held(malformed.clone()).is_err(), "{malformed}");
+        }
+        // A list no Safe could have produced is refused before any of it is
+        // recovered.
+        let many: Vec<Value> = (0..65).map(|_| json!({"signature":"0x01"})).collect();
+        assert!(held(json!(many)).is_err());
     }
 
     #[test]
@@ -3957,8 +4468,7 @@ mod tests {
 
     #[test]
     fn owner_signatures_are_recovered_deduplicated_and_address_sorted() {
-        let first = "0x9698aafeaf421f324a45e56046b6d6a2efcbdd85f8e7ce4134a827052b2e0c5a6086fd542c8757c8e614086c8da010913b0b8d578523ea728a724e636c52ee9b1c";
-        let second = "0x21d5a6bbeded469398a83760c4f3b5c42779188f5c6449655d675ad387ae548f63d024139aaf2fc95b0db58d5b8d24bfc441d185b58adafab24c7a903e6079491b";
+        let (first, second) = (OWNER_FIRST, OWNER_SECOND);
         let snapshot = SafeSnapshot {
             chain_id: "31337".into(),
             safe_address: "0x1000000000000000000000000000000000000000".into(),
@@ -3984,6 +4494,7 @@ mod tests {
             chain: "anvil".into(),
             safe: snapshot.clone(),
             transaction_service: None,
+            api: ServiceApi::Queue,
         };
         let state = TransactionState {
             schema: "bloom.safe.transaction.v1".into(),
@@ -4113,7 +4624,7 @@ mod tests {
         Binding {
             mode: BindingMode::Delegate,
             owner: "0x4000000000000000000000000000000000000000".into(),
-            transaction_service: Some("https://api.safe.global/tx-service/eth".into()),
+            transaction_service: Some("https://api.safe.global/queue".into()),
             ..binding()
         }
     }
@@ -4136,8 +4647,29 @@ mod tests {
         state
     }
 
+    /// A binding and signed draft whose Safe transaction hash is the one
+    /// `OWNER_FIRST` and `OWNER_SECOND` sign, so a signature the service holds
+    /// for it can be recovered to this Bloom account.
+    fn owner_signed() -> (Binding, TransactionState) {
+        let mut state = state("signed", TransactionRequest::Rejection);
+        state.snapshot.chain_id = "31337".into();
+        state.owner_signature = Some(OWNER_FIRST.into());
+        let mut binding = binding();
+        binding.safe.chain_id = "31337".into();
+        binding.transaction_service = Some("https://api.safe.global/queue".into());
+        assert_eq!(binding.owner, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
+        (binding, state)
+    }
+
+    /// A service record for this transaction with the confirmations the
+    /// service holds for it.
+    fn confirmed_record(state: &TransactionState, confirmations: Value) -> Value {
+        with(state, "confirmations", confirmations)
+    }
+
     fn service_record(state: &TransactionState) -> Value {
         json!({
+            "chainId":state.snapshot.chain_id,
             "safe":state.snapshot.safe_address,"to":state.safe_tx.to,"value":state.safe_tx.value,
             "data":state.safe_tx.data,"operation":state.safe_tx.operation,"safeTxGas":state.safe_tx.safe_tx_gas,
             "baseGas":state.safe_tx.base_gas,"gasPrice":state.safe_tx.gas_price,"gasToken":state.safe_tx.gas_token,
@@ -4145,9 +4677,23 @@ mod tests {
         })
     }
 
+    /// A Transaction Service record for a proposal it authenticated: the same
+    /// fields, marked as one owners are shown.
+    fn trusted_record(state: &TransactionState) -> Value {
+        with(state, "trusted", json!(true))
+    }
+
+    fn with(state: &TransactionState, field: &str, value: Value) -> Value {
+        let mut record = service_record(state);
+        record[field] = value;
+        record
+    }
+
+    /// A Queue Service grant: chain-scoped, with no `expiryDate` at all.
     fn grant(binding: &Binding) -> Value {
-        json!({"safe":binding.safe.safe_address,"delegate":binding.owner,
-               "delegator":binding.safe.owners[0],"expiryDate":null,"label":"Untrusted label"})
+        json!({"chainId":binding.safe.chain_id,"safe":binding.safe.safe_address,
+               "delegate":binding.owner,"delegator":binding.safe.owners[0],
+               "label":"Untrusted label"})
     }
 
     #[test]
@@ -4179,13 +4725,110 @@ mod tests {
         );
     }
 
+    /// Safe's multichain Queue Service is the default queueing API, and the
+    /// legacy per-chain Transaction Service is an explicit opt-in. The two
+    /// differ in paths, field names and which side computes `safeTxHash`, so
+    /// the binding names the API rather than the Petal inferring it from a
+    /// URL a service could change.
+    #[test]
+    fn the_queueing_api_is_named_by_the_binding_and_defaults_to_the_queue_service() {
+        let request: BindingRequest = serde_json::from_value(json!({
+            "chain":"ethereum","safe_address":snapshot().safe_address,
+            "transaction_service":"https://api.safe.global/queue"
+        }))
+        .unwrap();
+        assert_eq!(request.api, ServiceApi::Queue);
+        let legacy: BindingRequest = serde_json::from_value(json!({
+            "chain":"ethereum","safe_address":snapshot().safe_address,
+            "transaction_service":"https://api.safe.global/tx-service/eth",
+            "api":"transaction_service"
+        }))
+        .unwrap();
+        assert_eq!(legacy.api, ServiceApi::TransactionService);
+        assert!(
+            serde_json::from_value::<BindingRequest>(json!({
+                "chain":"ethereum","safe_address":snapshot().safe_address,"api":"queue_v2"
+            }))
+            .is_err()
+        );
+        // A fresh request defaults to the Queue Service, but a stored binding
+        // does not: one written without the field predates it, when the only
+        // API this Petal spoke was the per-chain Transaction Service, and the
+        // base it holds is a `tx-service` one. Keeping those on their original
+        // API keeps their paths, their field names and the hash pin they were
+        // proposed with; reading them as the Queue Service would silently
+        // change all three under an unchanged base URL.
+        let stored_before_the_field = json!({
+            "schema":"bloom.safe.binding.v1","wallet":"owner","mode":"owner",
+            "owner":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","chain":"ethereum",
+            "transaction_service":"https://api.safe.global/tx-service/eth",
+            "safe":serde_json::to_value(snapshot()).unwrap()
+        });
+        let restored: Binding = serde_json::from_value(stored_before_the_field).unwrap();
+        assert_eq!(restored.api, ServiceApi::TransactionService);
+        assert_eq!(
+            proposal(&restored, &delegate_state()).unwrap().0,
+            "/api/v1/safes/0x1000000000000000000000000000000000000000/multisig-transactions/"
+        );
+        // The same holds for a binding older still, from before `mode`, and
+        // for one bound offline with no service at all.
+        for older in [
+            json!({
+                "schema":"bloom.safe.binding.v1","wallet":"owner","chain":"ethereum",
+                "owner":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                "transaction_service":"https://safe-transaction-mainnet.safe.global",
+                "safe":serde_json::to_value(snapshot()).unwrap()
+            }),
+            json!({
+                "schema":"bloom.safe.binding.v1","wallet":"owner","chain":"ethereum",
+                "owner":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                "safe":serde_json::to_value(snapshot()).unwrap()
+            }),
+        ] {
+            let restored: Binding = serde_json::from_value(older).unwrap();
+            assert_eq!(restored.api, ServiceApi::TransactionService);
+            assert_eq!(restored.mode, BindingMode::Owner);
+        }
+        // Everything this build writes carries the field, on either API, so
+        // the legacy default never applies to a binding made from a request.
+        for api in [ServiceApi::Queue, ServiceApi::TransactionService] {
+            let written = serde_json::to_value(Binding { api, ..binding() }).unwrap();
+            assert_eq!(written["api"], json!(api));
+            assert_eq!(serde_json::from_value::<Binding>(written).unwrap().api, api);
+        }
+        assert_eq!(
+            serde_json::from_value::<Binding>(serde_json::to_value(legacy_binding()).unwrap())
+                .unwrap()
+                .api,
+            ServiceApi::TransactionService
+        );
+        // Both hosted bases pass the base-URL check.
+        for base in [
+            "https://api.safe.global/queue",
+            "https://api.safe.global/tx-service/eth",
+        ] {
+            assert_eq!(
+                validate_service(Some(base.into())).unwrap(),
+                Some(base.to_owned())
+            );
+        }
+    }
+
+    fn legacy_binding() -> Binding {
+        Binding {
+            api: ServiceApi::TransactionService,
+            transaction_service: Some("https://api.safe.global/tx-service/eth".into()),
+            ..binding()
+        }
+    }
+
     #[test]
     fn delegate_mode_requires_a_service_and_a_current_non_owner() {
         let mut delegate = delegate_binding();
         assert!(role_constraints(&delegate, &delegate.safe).is_ok());
         assert_eq!(
             bind("wallet", "1", "safe", br#"{"chain":"ethereum","safe_address":"0x4000000000000000000000000000000000000000","mode":"delegate"}"#),
-            invalid("delegate mode requires a Transaction Service")
+            invalid("delegate mode requires a queueing service")
         );
         let mut promoted = delegate.safe.clone();
         promoted.owners.push(delegate.owner.clone());
@@ -4198,12 +4841,14 @@ mod tests {
     #[test]
     fn delegation_requires_matching_scope_delegate_and_a_current_owner() {
         let binding = delegate_binding();
+        let api = binding.api;
         let exact = grant(&binding);
         assert!(delegate_grant_matches(
             &exact,
             &binding.owner,
             &binding.safe,
-            1
+            1,
+            api
         ));
         let mut global = exact.clone();
         global["safe"] = Value::Null;
@@ -4211,33 +4856,78 @@ mod tests {
             &global,
             &binding.owner,
             &binding.safe,
-            1
+            1,
+            api
         ));
         for field in ["safe", "delegate", "delegator"] {
             let mut foreign = exact.clone();
             foreign[field] = json!("0x5000000000000000000000000000000000000000");
             assert!(
-                !delegate_grant_matches(&foreign, &binding.owner, &binding.safe, 1),
+                !delegate_grant_matches(&foreign, &binding.owner, &binding.safe, 1, api),
                 "{field}"
             );
         }
         let mut removed = binding.safe.clone();
         removed.owners.remove(0);
-        assert!(!delegate_grant_matches(&exact, &binding.owner, &removed, 1));
+        assert!(!delegate_grant_matches(
+            &exact,
+            &binding.owner,
+            &removed,
+            1,
+            api
+        ));
         let mut missing_scope = exact;
         missing_scope.as_object_mut().unwrap().remove("safe");
         assert!(!delegate_grant_matches(
             &missing_scope,
             &binding.owner,
             &binding.safe,
-            1
+            1,
+            api
         ));
+    }
+
+    /// One Queue Service answers for every chain, so a grant names the chain
+    /// it was made for. A grant for another chain is not authority here, an
+    /// all-chain grant is, and a grant naming no chain at all is refused the
+    /// way a grant missing its Safe scope is rather than read as unscoped.
+    #[test]
+    fn a_delegation_authorizes_only_its_own_chain_or_every_chain() {
+        let binding = delegate_binding();
+        let matches = |grant: &Value, api| {
+            delegate_grant_matches(grant, &binding.owner, &binding.safe, 1, api)
+        };
+        let exact = grant(&binding);
+        assert_eq!(exact["chainId"], binding.safe.chain_id);
+        assert!(matches(&exact, ServiceApi::Queue));
+
+        let mut numeric = exact.clone();
+        numeric["chainId"] = json!(1);
+        assert!(matches(&numeric, ServiceApi::Queue));
+
+        let mut all_chains = exact.clone();
+        all_chains["chainId"] = Value::Null;
+        assert!(matches(&all_chains, ServiceApi::Queue));
+
+        for foreign in [json!("137"), json!(137), json!("1 "), json!(true)] {
+            let mut other = exact.clone();
+            other["chainId"] = foreign.clone();
+            assert!(!matches(&other, ServiceApi::Queue), "{foreign}");
+        }
+
+        let mut unscoped = exact;
+        unscoped.as_object_mut().unwrap().remove("chainId");
+        assert!(!matches(&unscoped, ServiceApi::Queue));
+        // The legacy service is reached per chain through its own base URL and
+        // sends no chainId, so its grants stay authority for that chain.
+        assert!(matches(&unscoped, ServiceApi::TransactionService));
     }
 
     #[test]
     fn expired_or_malformed_delegate_grants_do_not_authorize() {
         let binding = delegate_binding();
         let mut record = grant(&binding);
+        let api = binding.api;
         let now = 1_735_689_600_000; // 2025-01-01T00:00:00Z
         for expiry in [
             json!("2024-12-31T23:59:59Z"),
@@ -4250,7 +4940,8 @@ mod tests {
                 &record,
                 &binding.owner,
                 &binding.safe,
-                now
+                now,
+                api
             ));
         }
         record["expiryDate"] = json!("2025-01-01T01:00:01+01:00");
@@ -4258,7 +4949,8 @@ mod tests {
             &record,
             &binding.owner,
             &binding.safe,
-            now
+            now,
+            api
         ));
     }
 
@@ -4268,11 +4960,28 @@ mod tests {
         let mut calls = 0;
         verify_delegate_with(&binding, &binding.safe, 1, |path| {
             calls += 1;
-            assert!(path.ends_with("&limit=100"));
+            // No chainId filter: a chain-scoped query would hide the all-chain
+            // grants that also authorize this Safe.
+            assert_eq!(
+                path,
+                "/api/v1/delegates?delegate=0x4000000000000000000000000000000000000000&limit=100"
+            );
             Ok((200, json!({"results":[grant(&binding)],"next":null})))
         })
         .unwrap();
         assert_eq!(calls, 1);
+        let legacy = Binding {
+            api: ServiceApi::TransactionService,
+            ..binding.clone()
+        };
+        verify_delegate_with(&legacy, &legacy.safe, 1, |path| {
+            assert_eq!(
+                path,
+                "/api/v2/delegates/?delegate=0x4000000000000000000000000000000000000000&limit=100"
+            );
+            Ok((200, json!({"results":[grant(&legacy)],"next":null})))
+        })
+        .unwrap();
         for response in [
             json!({"results":[grant(&binding)],"next":"https://other.example/"}),
             json!({"results":[],"next":null}),
@@ -4318,7 +5027,7 @@ mod tests {
                     assert_eq!(method, "GET");
                     assert_eq!(
                         path,
-                        format!("/api/v1/multisig-transactions/{}/", state.safe_tx_hash)
+                        format!("/api/v1/multisig-transactions/{}", state.safe_tx_hash)
                     );
                     assert!(body.is_empty());
                     Ok((200, service_record(&state)))
@@ -4342,33 +5051,102 @@ mod tests {
             publish_with(&binding, &state, |method, path, body| {
                 calls.push(method.to_owned());
                 if method == "GET" {
-                    Ok((404, Value::Null))
+                    // A creation is read back under the locally computed hash.
+                    assert_eq!(
+                        path,
+                        format!("/api/v1/multisig-transactions/{}", state.safe_tx_hash)
+                    );
+                    Ok(if calls.len() == 1 {
+                        (404, Value::Null)
+                    } else {
+                        (200, service_record(&state))
+                    })
                 } else {
-                    assert!(!path.contains("confirmations"));
-                    assert!(path.starts_with("/api/v1/safes/"));
+                    assert!(!path.contains("signatures"));
+                    assert_eq!(path, "/api/v1/multisig-transactions");
                     let body: Value = serde_json::from_slice(&body).unwrap();
-                    assert_eq!(body["sender"], binding.owner);
-                    assert_eq!(body["signature"], state.delegate_signature.clone().unwrap());
-                    assert_eq!(body["contractTransactionHash"], state.safe_tx_hash);
+                    assert_eq!(
+                        body["signatures"],
+                        json!([state.delegate_signature.clone().unwrap()])
+                    );
+                    assert_eq!(body["chainId"], state.snapshot.chain_id);
+                    assert_eq!(body.get("sender"), None);
+                    assert_eq!(body.get("signature"), None);
                     Ok((201, Value::Null))
                 }
             })
             .unwrap(),
             "proposed"
         );
-        assert_eq!(calls, ["GET", "POST"]);
+        assert_eq!(calls, ["GET", "POST", "GET"]);
     }
 
+    /// The Queue Service computes `safeTxHash` itself and answers a creation
+    /// with the new confirmations rather than the transaction, so there is no
+    /// hash to pin in the request and nothing in the write to check. What it
+    /// stored is proved by reading it back under the hash computed here.
     #[test]
-    fn proposal_response_must_match_the_transaction() {
+    fn a_queue_proposal_is_read_back_under_the_locally_computed_hash() {
         let binding = delegate_binding();
         let state = delegate_state();
+        let read_back = |response: (u16, Value)| {
+            let mut gets = 0;
+            publish_with(&binding, &state, |method, _, _| {
+                if method == "GET" {
+                    gets += 1;
+                    Ok(if gets == 1 {
+                        (404, Value::Null)
+                    } else {
+                        response.clone()
+                    })
+                } else {
+                    // A creation body says nothing about the transaction.
+                    Ok((201, json!([{"owner":"0x1","signature":"0x2"}])))
+                }
+            })
+        };
+        assert_eq!(
+            read_back((200, service_record(&state))).unwrap(),
+            "proposed"
+        );
+        // Nothing stored under this hash: the service kept other fields.
+        assert!(read_back((404, Value::Null)).is_err());
+        // Stored under this hash, but not as the transaction that was signed.
+        let mut altered = service_record(&state);
+        altered["value"] = json!("8");
+        assert!(read_back((200, altered)).is_err());
+        let mut foreign_chain = service_record(&state);
+        foreign_chain["chainId"] = json!("137");
+        assert!(read_back((200, foreign_chain)).is_err());
+    }
+
+    /// 409 is the Queue Service's answer for a hash it already holds, which is
+    /// what a retry after a lost response gets. The record it holds must still
+    /// be this transaction, and in owner mode it still needs this signature.
+    #[test]
+    fn a_queue_conflict_falls_back_to_the_record_the_service_already_holds() {
+        let binding = delegate_binding();
+        let state = delegate_state();
+        let mut calls = vec![];
+        assert_eq!(
+            publish_with(&binding, &state, |method, _, _| {
+                calls.push(method.to_owned());
+                Ok(match method {
+                    "GET" if calls.len() == 1 => (404, Value::Null),
+                    "GET" => (200, service_record(&state)),
+                    _ => (409, json!({"detail":"already exists"})),
+                })
+            })
+            .unwrap(),
+            "proposed"
+        );
+        assert_eq!(calls, ["GET", "POST", "GET"]);
+        // A conflict over a record the service will not show is not success.
         assert!(
             publish_with(&binding, &state, |method, _, _| {
-                Ok(if method == "GET" {
-                    (404, Value::Null)
-                } else {
-                    (201, json!({"safeTxHash":"wrong"}))
+                Ok(match method {
+                    "GET" => (404, Value::Null),
+                    _ => (409, json!({"detail":"already exists"})),
                 })
             })
             .is_err()
@@ -4377,22 +5155,21 @@ mod tests {
 
     #[test]
     fn owner_mode_still_confirms_an_existing_service_transaction() {
-        let mut binding = binding();
+        let (mut binding, state) = owner_signed();
         binding.transaction_service = Some("https://safe.example".into());
-        let mut state = delegate_state();
-        state.mode = BindingMode::Owner;
-        state.owner_signature = Some("owner signature".into());
+        binding.api = ServiceApi::TransactionService;
+        let held = confirmed_record(&state, json!([{"signature":OWNER_FIRST}]));
         let mut calls = vec![];
         assert_eq!(
             publish_with(&binding, &state, |method, path, body| {
                 calls.push(method.to_owned());
                 if method == "GET" {
-                    Ok((200, service_record(&state)))
+                    Ok((200, held.clone()))
                 } else {
                     assert!(path.ends_with("/confirmations/"));
                     assert_eq!(
                         serde_json::from_slice::<Value>(&body).unwrap()["signature"],
-                        "owner signature"
+                        OWNER_FIRST
                     );
                     Ok((201, Value::Null))
                 }
@@ -4400,7 +5177,508 @@ mod tests {
             .unwrap(),
             "confirmed"
         );
+        // The empty 201 proves nothing, so the stored confirmation is read
+        // back under the locally computed hash on this service too.
+        assert_eq!(calls, ["GET", "POST", "GET"]);
+    }
+
+    /// The legacy Transaction Service keeps its own paths, its single
+    /// `signature`, and the `contractTransactionHash` it refuses fields that
+    /// do not hash to -- so a non-null echo is checked where it stands, as one
+    /// refusal more than the read-back every proposal is held to.
+    #[test]
+    fn the_legacy_transaction_service_keeps_its_pinned_hash_and_paths() {
+        let binding = Binding {
+            api: ServiceApi::TransactionService,
+            transaction_service: Some("https://api.safe.global/tx-service/eth".into()),
+            ..delegate_binding()
+        };
+        let state = delegate_state();
+        assert_eq!(
+            transaction_path(binding.api, &state.safe_tx_hash),
+            format!("/api/v1/multisig-transactions/{}/", state.safe_tx_hash)
+        );
+        let (path, body) = confirmation(binding.api, &state.safe_tx_hash, "0xabc");
+        assert_eq!(
+            path,
+            format!(
+                "/api/v1/multisig-transactions/{}/confirmations/",
+                state.safe_tx_hash
+            )
+        );
+        assert_eq!(body, json!({"signature":"0xabc"}));
+
+        let mut calls = vec![];
+        assert_eq!(
+            publish_with(&binding, &state, |method, path, body| {
+                calls.push(method.to_owned());
+                if method == "GET" {
+                    Ok(if calls.len() == 1 {
+                        (404, Value::Null)
+                    } else {
+                        (200, trusted_record(&state))
+                    })
+                } else {
+                    assert!(path.starts_with("/api/v1/safes/"));
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["contractTransactionHash"], state.safe_tx_hash);
+                    assert_eq!(body["sender"], binding.owner);
+                    assert_eq!(body["signature"], state.delegate_signature.clone().unwrap());
+                    assert_eq!(body.get("chainId"), None);
+                    assert_eq!(body.get("signatures"), None);
+                    Ok((201, Value::Null))
+                }
+            })
+            .unwrap(),
+            "proposed"
+        );
+        // A delegate proposal is still read back, because the pinned hash says
+        // nothing about whether the service kept it as trusted.
+        assert_eq!(calls, ["GET", "POST", "GET"]);
+
+        // An owner-mode creation is read back too. The pinned hash commits the
+        // service to the fields, but an accepted creation -- here the empty
+        // body this service answers with -- says nothing about the owner
+        // signature it carried, so success is the confirmation read back.
+        let (owner_binding, owner) = legacy_owner_signed();
+        let held = confirmed_record(&owner, json!([{"signature":OWNER_FIRST}]));
+        let mut calls = vec![];
+        assert_eq!(
+            publish_with(&owner_binding, &owner, |method, path, body| {
+                calls.push(method.to_owned());
+                if method == "GET" {
+                    Ok(if calls.len() == 1 {
+                        (404, Value::Null)
+                    } else {
+                        (200, held.clone())
+                    })
+                } else {
+                    assert!(path.starts_with("/api/v1/safes/"));
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["contractTransactionHash"], owner.safe_tx_hash);
+                    // The hosted service refuses an address that is not EIP-55
+                    // checksummed, in the path and in the body alike.
+                    assert_eq!(
+                        body["sender"],
+                        json!(
+                            address(&owner_binding.owner, "owner")
+                                .unwrap()
+                                .to_checksum(None)
+                        )
+                    );
+                    assert_eq!(body["signature"], OWNER_FIRST);
+                    assert_eq!(body.get("signatures"), None);
+                    Ok((201, Value::Null))
+                }
+            })
+            .unwrap(),
+            "proposed"
+        );
+        assert_eq!(calls, ["GET", "POST", "GET"]);
+
+        // An echo that is not this transaction still fails in place, before
+        // anything is read back.
+        let mut calls = vec![];
+        assert!(
+            publish_with(&owner_binding, &owner, |method, _, _| {
+                calls.push(method.to_owned());
+                Ok(if method == "GET" {
+                    (404, Value::Null)
+                } else {
+                    (201, json!({"safeTxHash":"wrong"}))
+                })
+            })
+            .is_err()
+        );
         assert_eq!(calls, ["GET", "POST"]);
+    }
+
+    /// `owner_signed`, bound to the legacy per-chain Transaction Service.
+    fn legacy_owner_signed() -> (Binding, TransactionState) {
+        let (binding, state) = owner_signed();
+        (
+            Binding {
+                api: ServiceApi::TransactionService,
+                transaction_service: Some("https://api.safe.global/tx-service/eth".into()),
+                ..binding
+            },
+            state,
+        )
+    }
+
+    /// An owner-mode proposal to the legacy Transaction Service fails closed on
+    /// exactly the terms a Queue one does. The service pins the hash it was
+    /// sent, so the signed fields it stored are not in doubt -- but the
+    /// confirmations are kept beside them, and an accepted creation shows
+    /// neither. Nothing short of the record read back under the locally
+    /// computed hash, holding a signature that recovers to this account, is
+    /// this account's confirmation.
+    #[test]
+    fn a_legacy_owner_proposal_needs_this_accounts_confirmation_read_back() {
+        let (binding, state) = legacy_owner_signed();
+        let propose = |read_back: (u16, Value)| {
+            let mut gets = 0;
+            publish_with(&binding, &state, |method, path, _| {
+                if method != "GET" {
+                    // The creation is accepted, and answered with nothing.
+                    return Ok((201, Value::Null));
+                }
+                gets += 1;
+                assert_eq!(
+                    path,
+                    format!("/api/v1/multisig-transactions/{}/", state.safe_tx_hash)
+                );
+                // Nothing is held yet, so the proposal is sent.
+                Ok(if gets == 1 {
+                    (404, Value::Null)
+                } else {
+                    read_back.clone()
+                })
+            })
+        };
+        assert_eq!(
+            propose((
+                200,
+                confirmed_record(&state, json!([{"signature":OWNER_FIRST}]))
+            ))
+            .unwrap(),
+            "proposed"
+        );
+        // A creation the service stored while keeping none of this account's
+        // signature is not a confirmed proposal, whether it holds no signature
+        // at all, only another owner's, or one that cannot be recovered.
+        for confirmations in [
+            json!([]),
+            json!([{"signature":OWNER_SECOND}]),
+            json!([{"signature":"0x00"}]),
+        ] {
+            assert_eq!(
+                propose((200, confirmed_record(&state, confirmations.clone()))),
+                Err(denied(UNSTORED_CONFIRMATION)),
+                "{confirmations}"
+            );
+        }
+        // A record that carries no confirmations at all, or carries them in a
+        // shape this Petal will not read, is refused rather than read as
+        // holding none.
+        for read_back in [
+            service_record(&state),
+            confirmed_record(&state, json!({})),
+            confirmed_record(&state, json!([{"owner":binding.owner}])),
+            confirmed_record(&state, json!([{"signature":["0x00"]}])),
+        ] {
+            assert!(propose((200, read_back.clone())).is_err(), "{read_back}");
+        }
+        // The read-back is this account's confirmation of this transaction or
+        // it is nothing: a signature held against other signed fields, and a
+        // read-back that cannot be had at all, both fail closed.
+        let mut altered = confirmed_record(&state, json!([{"signature":OWNER_FIRST}]));
+        altered["nonce"] = json!("99");
+        assert!(propose((200, altered)).is_err());
+        assert!(propose((404, Value::Null)).is_err());
+        assert!(propose((503, json!("unavailable"))).is_err());
+    }
+
+    /// A delegate proposal only counts as published once the service holds it
+    /// where owners are shown it.
+    ///
+    /// The Queue Service requires a signature with a creation and derives the
+    /// proposer from it, so a record it holds was authenticated when it was
+    /// made. The Transaction Service also stores proposals it did not
+    /// authenticate, as `trusted: false`, and leaves those out of the listings
+    /// owners read -- anyone who can reach the service can leave one under this
+    /// hash. Reporting one of those back as this delegate's published proposal
+    /// would tell the operator owners can act on something they cannot see, so
+    /// the proposal is sent instead, and nothing short of `trusted: true` is
+    /// taken as proof.
+    #[test]
+    fn a_legacy_untrusted_record_is_not_a_published_delegate_proposal() {
+        let binding = Binding {
+            api: ServiceApi::TransactionService,
+            transaction_service: Some("https://api.safe.global/tx-service/eth".into()),
+            ..delegate_binding()
+        };
+        let state = delegate_state();
+        // Only `trusted: true` is proof; anything else, including the field
+        // being absent as in a record this Petal did not propose, is not.
+        assert!(proposal_is_published(&trusted_record(&state), binding.api));
+        for held in [
+            service_record(&state),
+            with(&state, "trusted", json!(false)),
+            with(&state, "trusted", json!("true")),
+            with(&state, "trusted", json!(1)),
+            with(&state, "trusted", Value::Null),
+        ] {
+            assert!(!proposal_is_published(&held, binding.api));
+            // On the Queue Service the question does not arise: it holds no
+            // record it did not authenticate.
+            assert!(proposal_is_published(&held, ServiceApi::Queue));
+        }
+
+        // An untrusted record under this hash is not success: the delegate
+        // proposal is sent, and publishing it is proved by the read-back.
+        let mut calls = vec![];
+        assert_eq!(
+            publish_with(&binding, &state, |method, _, _| {
+                calls.push(method.to_owned());
+                Ok(match method {
+                    "GET" if calls.len() == 1 => (200, with(&state, "trusted", json!(false))),
+                    "GET" => (200, trusted_record(&state)),
+                    _ => (201, Value::Null),
+                })
+            })
+            .unwrap(),
+            "proposed"
+        );
+        assert_eq!(calls, ["GET", "POST", "GET"]);
+
+        // A service that keeps the proposal untrusted is a failure, not a
+        // proposal reported as published.
+        for after in [
+            with(&state, "trusted", json!(false)),
+            service_record(&state),
+        ] {
+            assert!(
+                publish_with(&binding, &state, |method, _, _| {
+                    Ok(if method == "GET" {
+                        (200, after.clone())
+                    } else {
+                        (201, Value::Null)
+                    })
+                })
+                .is_err()
+            );
+        }
+
+        // A trusted record that already holds this proposal stays idempotent,
+        // with no write at all.
+        let mut calls = vec![];
+        assert_eq!(
+            publish_with(&binding, &state, |method, _, _| {
+                calls.push(method.to_owned());
+                Ok((200, trusted_record(&state)))
+            })
+            .unwrap(),
+            "proposed"
+        );
+        assert_eq!(calls, ["GET"]);
+
+        // An untrusted record whose fields are not the signed ones is refused
+        // outright rather than re-proposed over.
+        let mut altered = trusted_record(&state);
+        altered["trusted"] = json!(false);
+        altered["nonce"] = json!("99");
+        assert!(publish_with(&binding, &state, |_, _, _| Ok((200, altered.clone()))).is_err());
+    }
+
+    /// The Queue Service takes a list of signatures at its own `signatures`
+    /// path, and refuses a repeat confirmation from an owner it already holds
+    /// one from with 409 -- the answer a retry after a lost response gets.
+    /// Neither a 2xx nor a 409 is success by itself: the signature the service
+    /// holds has to be recovered to this owner over this transaction.
+    #[test]
+    fn a_queue_confirmation_sends_a_signature_list_and_verifies_what_is_stored() {
+        // `OWNER_FIRST` and `OWNER_SECOND` are those owners' signatures of the
+        // hash this state holds, so a held confirmation can be recovered.
+        let (binding, state) = owner_signed();
+        let signature = OWNER_FIRST;
+        let held = confirmed_record(&state, json!([{"signature":signature}]));
+
+        let mut calls = vec![];
+        assert_eq!(
+            publish_with(&binding, &state, |method, path, body| {
+                calls.push(method.to_owned());
+                if method == "GET" {
+                    Ok((200, held.clone()))
+                } else {
+                    assert_eq!(
+                        path,
+                        format!(
+                            "/api/v1/multisig-transactions/{}/signatures",
+                            state.safe_tx_hash
+                        )
+                    );
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["signatures"], json!([signature]));
+                    assert_eq!(body.get("signature"), None);
+                    Ok((201, json!([{"owner":binding.owner,"signature":signature}])))
+                }
+            })
+            .unwrap(),
+            "confirmed"
+        );
+        // The creation answer is a signature list, not the transaction, so
+        // what was stored is proved by the read-back and not by the 201.
+        assert_eq!(calls, ["GET", "POST", "GET"]);
+
+        // Whatever the write answered, success is the confirmation the service
+        // is read back as holding.
+        let stored = |confirmations: Value, status: u16| {
+            let record = confirmed_record(&state, confirmations);
+            publish_with(&binding, &state, |method, _, _| {
+                Ok(match method {
+                    "GET" => (200, record.clone()),
+                    _ => (status, json!({"detail":"already confirmed"})),
+                })
+            })
+        };
+        for status in [200, 201, 202, 409] {
+            assert_eq!(
+                stored(json!([{"signature":signature}]), status).unwrap(),
+                "confirmed",
+                "{status}"
+            );
+            // Nothing of ours held is not a confirmation, whether the service
+            // holds no signature at all, only another owner's, or one that
+            // cannot be recovered -- and a 2xx does not make it one.
+            for confirmations in [
+                json!([]),
+                json!([{"signature":OWNER_SECOND}]),
+                json!([{"signature":"0x00"}]),
+            ] {
+                assert!(
+                    stored(confirmations.clone(), status).is_err(),
+                    "{status} {confirmations}"
+                );
+            }
+        }
+    }
+
+    /// A confirmation the service accepted but will not show back is not a
+    /// confirmation. Neither is one whose read-back cannot be had at all: an
+    /// accepted write whose outcome is unknown fails closed rather than
+    /// reporting an owner confirmation the service may never have kept.
+    #[test]
+    fn an_accepted_confirmation_fails_closed_when_the_read_back_does_not_hold_it() {
+        let (binding, state) = owner_signed();
+        let confirm = |read_back: (u16, Value)| {
+            let mut gets = 0;
+            publish_with(&binding, &state, |method, _, _| {
+                if method != "GET" {
+                    return Ok((201, Value::Null));
+                }
+                gets += 1;
+                Ok(if gets == 1 {
+                    (200, confirmed_record(&state, json!([])))
+                } else {
+                    read_back.clone()
+                })
+            })
+        };
+        assert_eq!(
+            confirm((
+                200,
+                confirmed_record(&state, json!([{"signature":OWNER_FIRST}]))
+            ))
+            .unwrap(),
+            "confirmed"
+        );
+        // The record cannot be read back, or is no longer there.
+        assert!(confirm((404, Value::Null)).is_err());
+        assert!(confirm((503, json!("unavailable"))).is_err());
+        // It is read back, but not as the transaction that was signed.
+        let mut altered = confirmed_record(&state, json!([{"signature":OWNER_FIRST}]));
+        altered["nonce"] = json!("99");
+        assert!(confirm((200, altered)).is_err());
+        // It is read back as this transaction, holding no confirmations at
+        // all, or holding them in a shape this Petal will not read.
+        assert!(confirm((200, service_record(&state))).is_err());
+        assert!(confirm((200, confirmed_record(&state, json!({})))).is_err());
+        assert!(
+            confirm((
+                200,
+                confirmed_record(&state, json!([{"owner":binding.owner}]))
+            ))
+            .is_err()
+        );
+        assert!(
+            confirm((
+                200,
+                confirmed_record(&state, json!([{"signature":["0x00"]}]))
+            ))
+            .is_err()
+        );
+    }
+
+    /// An owner-mode Queue proposal carries this account's owner signature as
+    /// the creation's authentication, so it is only success once the service
+    /// is read back holding that confirmation. Matching signed fields do not
+    /// show it: a record reads the same whether the signature was kept or
+    /// dropped. Delegate mode is checked separately -- a delegate contributes
+    /// no confirmation, and what it needs is a published proposal.
+    #[test]
+    fn an_owner_mode_queue_proposal_needs_this_accounts_confirmation_read_back() {
+        let (binding, state) = owner_signed();
+        let mut posts = 0;
+        let propose = |read_back: Value, posts: &mut usize| {
+            let mut gets = 0;
+            publish_with(&binding, &state, |method, path, body| {
+                if method == "GET" {
+                    gets += 1;
+                    // Nothing is held yet, so the proposal is sent.
+                    return Ok(if gets == 1 {
+                        (404, Value::Null)
+                    } else {
+                        (200, read_back.clone())
+                    });
+                }
+                *posts += 1;
+                // An owner-mode proposal is a creation, never a confirmation.
+                assert_eq!(path, "/api/v1/multisig-transactions");
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["signatures"], json!([OWNER_FIRST]));
+                // The Queue Service answers a creation with the confirmations
+                // it now holds rather than with the transaction.
+                Ok((
+                    201,
+                    json!([{"owner":binding.owner,"signature":OWNER_FIRST}]),
+                ))
+            })
+        };
+        assert_eq!(
+            propose(
+                confirmed_record(&state, json!([{"signature":OWNER_FIRST}])),
+                &mut posts
+            )
+            .unwrap(),
+            "proposed"
+        );
+        // A creation the service stored while keeping none of this account's
+        // signature is not a confirmed proposal, however it answered.
+        for read_back in [
+            service_record(&state),
+            confirmed_record(&state, json!([])),
+            confirmed_record(&state, json!([{"signature":OWNER_SECOND}])),
+            confirmed_record(&state, json!([{"signature":"0x00"}])),
+        ] {
+            assert!(
+                propose(read_back.clone(), &mut posts).is_err(),
+                "{read_back}"
+            );
+        }
+        assert_eq!(posts, 5);
+
+        // In delegate mode the same read-back needs a published proposal
+        // instead, and no confirmation of its own.
+        let delegate = delegate_binding();
+        let delegate_state = delegate_state();
+        let mut gets = 0;
+        assert_eq!(
+            publish_with(&delegate, &delegate_state, |method, _, _| {
+                if method == "GET" {
+                    gets += 1;
+                    Ok(if gets == 1 {
+                        (404, Value::Null)
+                    } else {
+                        (200, service_record(&delegate_state))
+                    })
+                } else {
+                    Ok((201, Value::Null))
+                }
+            })
+            .unwrap(),
+            "proposed"
+        );
     }
 
     #[test]
